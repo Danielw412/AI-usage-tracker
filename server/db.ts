@@ -3,16 +3,16 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { cleanDisplayText } from './messageText.js';
 import type {
+  CloudTask,
   DailyUsage,
-  ModelEfficiency,
   ModelUsageSummary,
   PricingStatus,
   PromptMetric,
   RateLimitWindow,
   SessionPartKind,
   ThreadPartSummary,
+  ThreadSource,
   ThreadSummary,
-  TitleSource,
   TokenUsage
 } from './types.js';
 
@@ -22,6 +22,14 @@ const db = new DatabaseSync(path.join(dataDir, 'codex-usage.sqlite'));
 db.exec('PRAGMA busy_timeout = 5000;');
 db.exec('PRAGMA journal_mode = WAL;');
 db.exec('PRAGMA foreign_keys = ON;');
+
+/**
+ * Bump when the meaning of stored thread metadata changes. Older builds stored
+ * raw prompt text in display_name, so that column is cleared on upgrade and
+ * repopulated from Codex's generated names.
+ */
+const METADATA_VERSION = '3';
+const AUTO_REVIEW_MODEL = 'codex-auto-review';
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS rate_limit_snapshots (
@@ -36,6 +44,8 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_rate_history
     ON rate_limit_snapshots(limit_key, resets_at, observed_at);
+  CREATE INDEX IF NOT EXISTS idx_rate_history_duration
+    ON rate_limit_snapshots(duration_mins, observed_at);
 
   CREATE TABLE IF NOT EXISTS account_daily_usage (
     usage_date TEXT PRIMARY KEY,
@@ -111,6 +121,8 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_prompt_metrics_thread
     ON prompt_metrics(thread_id, started_at);
+  CREATE INDEX IF NOT EXISTS idx_prompt_metrics_completed
+    ON prompt_metrics(completed_at);
 
   CREATE TABLE IF NOT EXISTS thread_metadata (
     thread_id TEXT PRIMARY KEY,
@@ -118,7 +130,69 @@ db.exec(`
     preview TEXT,
     updated_at INTEGER NOT NULL
   );
+
+  CREATE TABLE IF NOT EXISTS cloud_tasks (
+    task_id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    status TEXT NOT NULL,
+    updated_at INTEGER,
+    environment_label TEXT,
+    url TEXT,
+    is_review INTEGER NOT NULL DEFAULT 0,
+    files_changed INTEGER,
+    lines_added INTEGER,
+    lines_removed INTEGER,
+    first_seen_at INTEGER NOT NULL,
+    last_seen_at INTEGER NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS dashboard_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+  );
 `);
+
+function tableColumns(table: string): Set<string> {
+  return new Set(
+    (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>)
+      .map((row) => row.name)
+  );
+}
+
+function ensureColumn(table: string, column: string, definition: string): void {
+  if (!tableColumns(table).has(column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  }
+}
+
+ensureColumn('thread_metadata', 'source', 'TEXT');
+ensureColumn('thread_metadata', 'source_label', 'TEXT');
+ensureColumn('thread_metadata', 'model', 'TEXT');
+ensureColumn('thread_metadata', 'reasoning_effort', 'TEXT');
+ensureColumn('thread_metadata', 'git_branch', 'TEXT');
+ensureColumn('thread_metadata', 'project_name', 'TEXT');
+ensureColumn('thread_metadata', 'archived', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('session_parts', 'source', 'TEXT');
+ensureColumn('session_parts', 'source_label', 'TEXT');
+
+function getMeta(key: string): string | null {
+  const row = db.prepare('SELECT value FROM dashboard_meta WHERE key = ?').get(key) as
+    | { value: string }
+    | undefined;
+  return row?.value ?? null;
+}
+
+function setMeta(key: string, value: string): void {
+  db.prepare(`
+    INSERT INTO dashboard_meta (key, value) VALUES (?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+  `).run(key, value);
+}
+
+if (getMeta('metadata_version') !== METADATA_VERSION) {
+  db.exec('UPDATE thread_metadata SET display_name = NULL');
+  setMeta('metadata_version', METADATA_VERSION);
+}
 
 function rows<T>(value: unknown): T[] {
   return value as T[];
@@ -227,8 +301,8 @@ export function replaceThreadData(
       project_path, started_at, updated_at, primary_model, models_json,
       input_tokens, cached_input_tokens, output_tokens,
       reasoning_output_tokens, total_tokens, estimated_cost_usd,
-      pricing_status, user_message_count
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      pricing_status, user_message_count, source, source_label
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(source_file) DO UPDATE SET
       modified_ms = excluded.modified_ms,
       size_bytes = excluded.size_bytes,
@@ -247,7 +321,9 @@ export function replaceThreadData(
       total_tokens = excluded.total_tokens,
       estimated_cost_usd = excluded.estimated_cost_usd,
       pricing_status = excluded.pricing_status,
-      user_message_count = excluded.user_message_count
+      user_message_count = excluded.user_message_count,
+      source = excluded.source,
+      source_label = excluded.source_label
   `);
   const insertEvent = db.prepare(`
     INSERT INTO session_part_token_events (
@@ -287,7 +363,9 @@ export function replaceThreadData(
       summary.totalTokens,
       summary.estimatedApiCostUsd,
       summary.pricingStatus,
-      summary.userMessageCount
+      summary.userMessageCount,
+      summary.source,
+      summary.sourceLabel
     );
     db.prepare('DELETE FROM session_part_token_events WHERE source_file = ?').run(summary.sourceFile);
     db.prepare('DELETE FROM prompt_metrics WHERE source_file = ?').run(summary.sourceFile);
@@ -331,32 +409,66 @@ export function replaceThreadData(
       );
     }
     db.exec('COMMIT;');
+    invalidateThreadSummaries();
   } catch (error) {
     db.exec('ROLLBACK;');
     throw error;
   }
 }
 
-export function upsertThreadMetadata(items: Array<{
+export interface ThreadMetadataInput {
   threadId: string;
+  /** Only ever a Codex-generated chat name. Pass null when unknown. */
   displayName: string | null;
   preview: string | null;
   updatedAt: number;
-}>): void {
+  source?: ThreadSource | null;
+  sourceLabel?: string | null;
+  model?: string | null;
+  reasoningEffort?: string | null;
+  gitBranch?: string | null;
+  projectName?: string | null;
+  archived?: boolean;
+}
+
+export function upsertThreadMetadata(items: ThreadMetadataInput[]): void {
   const statement = db.prepare(`
-    INSERT INTO thread_metadata (thread_id, display_name, preview, updated_at)
-    VALUES (?, ?, ?, ?)
+    INSERT INTO thread_metadata (
+      thread_id, display_name, preview, updated_at, source, source_label, model,
+      reasoning_effort, git_branch, project_name, archived
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(thread_id) DO UPDATE SET
       display_name = COALESCE(excluded.display_name, thread_metadata.display_name),
       preview = COALESCE(excluded.preview, thread_metadata.preview),
-      updated_at = MAX(excluded.updated_at, thread_metadata.updated_at)
+      updated_at = MAX(excluded.updated_at, thread_metadata.updated_at),
+      source = COALESCE(excluded.source, thread_metadata.source),
+      source_label = COALESCE(excluded.source_label, thread_metadata.source_label),
+      model = COALESCE(excluded.model, thread_metadata.model),
+      reasoning_effort = COALESCE(excluded.reasoning_effort, thread_metadata.reasoning_effort),
+      git_branch = COALESCE(excluded.git_branch, thread_metadata.git_branch),
+      project_name = COALESCE(excluded.project_name, thread_metadata.project_name),
+      archived = COALESCE(excluded.archived, thread_metadata.archived)
   `);
   db.exec('BEGIN IMMEDIATE;');
   try {
     for (const item of items) {
-      statement.run(item.threadId, item.displayName, item.preview, item.updatedAt);
+      statement.run(
+        item.threadId,
+        item.displayName,
+        item.preview,
+        item.updatedAt,
+        item.source ?? null,
+        item.sourceLabel ?? null,
+        item.model ?? null,
+        item.reasoningEffort ?? null,
+        item.gitBranch ?? null,
+        item.projectName ?? null,
+        item.archived === undefined ? null : item.archived ? 1 : 0
+      );
     }
     db.exec('COMMIT;');
+    invalidateThreadSummaries();
   } catch (error) {
     db.exec('ROLLBACK;');
     throw error;
@@ -376,6 +488,8 @@ interface PartRow extends TokenUsage {
   estimatedApiCostUsd: number | null;
   pricingStatus: PricingStatus;
   userMessageCount: number;
+  source: ThreadSource | null;
+  sourceLabel: string | null;
 }
 
 interface ModelTokenRow {
@@ -388,6 +502,13 @@ interface MetadataRow {
   threadId: string;
   displayName: string | null;
   preview: string | null;
+  source: ThreadSource | null;
+  sourceLabel: string | null;
+  model: string | null;
+  reasoningEffort: string | null;
+  gitBranch: string | null;
+  projectName: string | null;
+  archived: number;
 }
 
 interface PromptRow extends TokenUsage {
@@ -436,7 +557,52 @@ function getPromptMap(): Map<string, PromptMetric[]> {
   return map;
 }
 
+/** Temporary workspaces are named by hash, which is not a useful project label. */
+function readableProjectName(name: string | null): string | null {
+  if (!name) return null;
+  if (/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}/i.test(name) || /^[0-9a-f]{24,}$/i.test(name)) return null;
+  return name;
+}
+
+function fallbackTitle(source: ThreadSource, sourceLabel: string | null, projectName: string | null): string {
+  const readable = readableProjectName(projectName);
+  const scope = readable ? ` in ${readable}` : '';
+  switch (source) {
+    case 'exec':
+      return `${sourceLabel ? `${sourceLabel} run` : 'Scripted run'}${scope}`;
+    case 'review':
+      return `Auto-review session${scope}`;
+    case 'subagent':
+      return `Subagent session${scope}`;
+    case 'cloud':
+      return `Cloud task${scope}`;
+    case 'voice':
+      return `Voice session${scope}`;
+    default:
+      return `Untitled chat${scope}`;
+  }
+}
+
+function projectNameFromPath(projectPath: string | null): string | null {
+  if (!projectPath) return null;
+  const parts = projectPath.replace(/^\\\\\?\\/, '').split(/[\\/]/).filter(Boolean);
+  return parts.at(-1) ?? null;
+}
+
+let summaryCache: { builtAt: number; version: number; value: ThreadSummary[] } | null = null;
+let summaryVersion = 0;
+
+/** Call after any write that changes thread rows so the summary cache is rebuilt. */
+export function invalidateThreadSummaries(): void {
+  summaryVersion += 1;
+}
+
 function buildThreadSummaries(): ThreadSummary[] {
+  const now = Date.now();
+  if (summaryCache && summaryCache.version === summaryVersion && now - summaryCache.builtAt < 15_000) {
+    return summaryCache.value;
+  }
+
   const parts = rows<PartRow>(db.prepare(`
     SELECT source_file AS sourceFile, thread_id AS threadId, part_kind AS partKind,
            title, project_path AS projectPath, started_at AS startedAt,
@@ -445,14 +611,17 @@ function buildThreadSummaries(): ThreadSummary[] {
            cached_input_tokens AS cachedInputTokens, output_tokens AS outputTokens,
            reasoning_output_tokens AS reasoningOutputTokens,
            total_tokens AS totalTokens, estimated_cost_usd AS estimatedApiCostUsd,
-           pricing_status AS pricingStatus, user_message_count AS userMessageCount
+           pricing_status AS pricingStatus, user_message_count AS userMessageCount,
+           source, source_label AS sourceLabel
     FROM session_parts
     ORDER BY COALESCE(started_at, updated_at, 0) ASC
   `).all());
 
   const metadata = new Map(
     rows<MetadataRow>(db.prepare(`
-      SELECT thread_id AS threadId, display_name AS displayName, preview
+      SELECT thread_id AS threadId, display_name AS displayName, preview,
+             source, source_label AS sourceLabel, model, reasoning_effort AS reasoningEffort,
+             git_branch AS gitBranch, project_name AS projectName, archived
       FROM thread_metadata
     `).all()).map((row) => [row.threadId, row])
   );
@@ -462,7 +631,7 @@ function buildThreadSummaries(): ThreadSummary[] {
     SELECT e.thread_id AS threadId, e.model, SUM(e.total_tokens) AS totalTokens
     FROM session_part_token_events e
     JOIN session_parts p ON p.source_file = e.source_file
-    WHERE p.part_kind = 'main' AND lower(e.model) <> 'codex-auto-review'
+    WHERE p.part_kind = 'main' AND lower(e.model) <> '${AUTO_REVIEW_MODEL}'
     GROUP BY e.thread_id, e.model
   `).all());
   const modelWeights = new Map<string, Map<string, number>>();
@@ -472,16 +641,24 @@ function buildThreadSummaries(): ThreadSummary[] {
     modelWeights.set(row.threadId, weights);
   }
 
-  const grouped = new Map<string, ThreadSummary & { hasPriced: boolean; hasUnpriced: boolean }>();
+  type Draft = ThreadSummary & { hasPriced: boolean; hasUnpriced: boolean; promptTitle: string | null };
+  const grouped = new Map<string, Draft>();
   for (const part of parts) {
     const partModels = JSON.parse(part.modelsJson) as string[];
     let thread = grouped.get(part.threadId);
     if (!thread) {
       thread = {
         threadId: part.threadId,
-        title: part.partKind === 'main' && part.title ? part.title : 'Untitled Codex thread',
-        titleSource: part.partKind === 'main' && part.title ? 'prompt' : 'fallback',
+        title: '',
+        titleSource: 'fallback',
+        preview: null,
         projectPath: part.partKind === 'main' ? part.projectPath : null,
+        projectName: null,
+        source: part.partKind === 'main' ? (part.source ?? 'unknown') : 'unknown',
+        sourceLabel: part.partKind === 'main' ? part.sourceLabel : null,
+        reasoningEffort: null,
+        gitBranch: null,
+        archived: false,
         startedAt: part.startedAt,
         updatedAt: part.updatedAt,
         primaryModel: part.partKind === 'main' ? part.primaryModel : 'unknown',
@@ -496,29 +673,32 @@ function buildThreadSummaries(): ThreadSummary[] {
         sourceFile: part.sourceFile,
         userMessageCount: 0,
         reviewerTokens: 0,
+        subagentTokens: 0,
         partCount: 0,
         prompts: [],
-        estimatedFiveHourUsagePercent: null,
-        estimatedSevenDayUsagePercent: null,
-        usageSampleIntervals: 0,
-        usageResetSegments: 0,
+        usage: { fiveHour: null, sevenDay: null },
         hasPriced: false,
-        hasUnpriced: false
+        hasUnpriced: false,
+        promptTitle: null
       };
       grouped.set(part.threadId, thread);
     }
 
     if (part.partKind === 'main') {
-      if (thread.titleSource === 'fallback' && part.title) {
-        thread.title = part.title;
-        thread.titleSource = 'prompt';
-      }
+      thread.promptTitle ??= part.title;
       if (!thread.projectPath && part.projectPath) thread.projectPath = part.projectPath;
       if (thread.primaryModel === 'unknown' && part.primaryModel !== 'unknown') {
         thread.primaryModel = part.primaryModel;
       }
+      if (thread.source === 'unknown' && part.source) thread.source = part.source;
+      thread.sourceLabel ??= part.sourceLabel;
       thread.sourceFile = part.sourceFile;
       thread.userMessageCount += part.userMessageCount;
+      // Review sessions are priced by their parent; only main and subagent parts
+      // decide whether a thread's cost estimate is complete.
+      if (part.pricingStatus !== 'exact-model-match') thread.hasUnpriced = true;
+    } else if (part.partKind === 'subagent' && part.pricingStatus !== 'exact-model-match') {
+      thread.hasUnpriced = true;
     }
 
     thread.startedAt = thread.startedAt === null
@@ -537,13 +717,13 @@ function buildThreadSummaries(): ThreadSummary[] {
     thread.reasoningOutputTokens += part.reasoningOutputTokens;
     thread.totalTokens += part.totalTokens;
     if (part.partKind === 'reviewer') thread.reviewerTokens += part.totalTokens;
+    if (part.partKind === 'subagent') thread.subagentTokens += part.totalTokens;
     thread.partCount += 1;
     for (const model of partModels) if (!thread.models.includes(model)) thread.models.push(model);
     if (part.estimatedApiCostUsd !== null) {
       thread.estimatedApiCostUsd = (thread.estimatedApiCostUsd ?? 0) + part.estimatedApiCostUsd;
       thread.hasPriced = true;
     }
-    if (part.pricingStatus !== 'exact-model-match') thread.hasUnpriced = true;
   }
 
   for (const thread of grouped.values()) {
@@ -552,7 +732,7 @@ function buildThreadSummaries(): ThreadSummary[] {
       ? [...weights.entries()].sort((a, b) => b[1] - a[1])[0]?.[0]
       : null;
     if (weightedPrimary) thread.primaryModel = weightedPrimary;
-    if (thread.primaryModel === 'codex-auto-review') thread.primaryModel = 'unknown';
+    if (thread.primaryModel === AUTO_REVIEW_MODEL) thread.primaryModel = 'unknown';
     thread.pricingStatus = !thread.hasPriced
       ? 'unknown'
       : thread.hasUnpriced
@@ -560,25 +740,63 @@ function buildThreadSummaries(): ThreadSummary[] {
         : 'exact-model-match';
     thread.prompts = promptMap.get(thread.threadId) ?? [];
 
-    const storedMetadata = metadata.get(thread.threadId);
-    const displayName = cleanDisplayText(storedMetadata?.displayName ?? null);
-    const preview = cleanDisplayText(storedMetadata?.preview ?? null);
+    const stored = metadata.get(thread.threadId);
+    if (stored) {
+      if (stored.source && (thread.source === 'unknown' || stored.source !== 'unknown')) {
+        thread.source = stored.source;
+      }
+      thread.sourceLabel = stored.sourceLabel ?? thread.sourceLabel;
+      thread.reasoningEffort = stored.reasoningEffort;
+      thread.gitBranch = stored.gitBranch;
+      thread.projectName = stored.projectName;
+      thread.archived = stored.archived === 1;
+      if (thread.primaryModel === 'unknown' && stored.model) thread.primaryModel = stored.model;
+    }
+    thread.projectName ??= projectNameFromPath(thread.projectPath);
+
+    const displayName = cleanDisplayText(stored?.displayName ?? null, 160);
+    const preview = cleanDisplayText(stored?.preview ?? null, 160);
+    const promptTitle = cleanDisplayText(thread.promptTitle, 160);
+    thread.preview = preview ?? promptTitle;
+    // Scripted runs share one generic prompt, so the script label is the better name.
+    const labelled = thread.source === 'exec' && thread.sourceLabel !== null;
     if (displayName) {
       thread.title = displayName;
       thread.titleSource = 'codex-name';
+    } else if (labelled) {
+      thread.title = fallbackTitle(thread.source, thread.sourceLabel, thread.projectName);
+      thread.titleSource = 'fallback';
     } else if (preview) {
       thread.title = preview;
       thread.titleSource = 'codex-preview';
+    } else if (promptTitle) {
+      thread.title = promptTitle;
+      thread.titleSource = 'prompt';
+    } else {
+      thread.title = fallbackTitle(thread.source, thread.sourceLabel, thread.projectName);
+      thread.titleSource = 'fallback';
     }
+    if (thread.preview === thread.title) thread.preview = null;
   }
 
-  return [...grouped.values()]
-    .map(({ hasPriced: _hasPriced, hasUnpriced: _hasUnpriced, ...thread }) => thread)
+  const value = [...grouped.values()]
+    .map(({ hasPriced: _hasPriced, hasUnpriced: _hasUnpriced, promptTitle: _promptTitle, ...thread }) => thread)
     .sort((a, b) => (b.updatedAt ?? b.startedAt ?? 0) - (a.updatedAt ?? a.startedAt ?? 0));
+  summaryCache = { builtAt: now, version: summaryVersion, value };
+  return value;
 }
 
 export function getThreadSummaries(limit = 100): ThreadSummary[] {
   return buildThreadSummaries().slice(0, limit);
+}
+
+export function getThreadTitleMap(): Map<string, { title: string; model: string }> {
+  return new Map(
+    buildThreadSummaries().map((thread) => [
+      thread.threadId,
+      { title: thread.title, model: thread.primaryModel }
+    ])
+  );
 }
 
 type TokenTotals = TokenUsage & {
@@ -631,112 +849,64 @@ export function getLocalDailyUsage(days = 7): DailyUsage[] {
   return rows<DailyUsage>(result);
 }
 
-export function getThreadTokenEvents(since: number): Array<{
+export interface TokenEventRow {
   observedAt: number;
   threadId: string;
-  totalTokens: number;
-  estimatedApiCostUsd: number;
-}> {
-  return rows<{
-    observedAt: number;
-    threadId: string;
-    totalTokens: number;
-    estimatedApiCostUsd: number;
-  }>(db.prepare(`
-    SELECT observed_at AS observedAt, thread_id AS threadId,
-           total_tokens AS totalTokens, COALESCE(estimated_cost_usd, 0) AS estimatedApiCostUsd
-    FROM session_part_token_events
-    WHERE observed_at >= ?
-    ORDER BY observed_at ASC
-  `).all(since));
-}
-
-export function getThreadTaskRuns(since: number): Array<{
-  threadId: string;
-  startedAt: number;
-  completedAt: number;
-}> {
-  return rows<{
-    threadId: string;
-    startedAt: number;
-    completedAt: number;
-  }>(db.prepare(`
-    SELECT thread_id AS threadId, started_at AS startedAt, completed_at AS completedAt
-    FROM prompt_metrics
-    WHERE completed_at IS NOT NULL AND completed_at >= ?
-    ORDER BY started_at ASC
-  `).all(since));
-}
-
-export function getRecentChatTaskRuns(chatLimit: number): Array<{
-  promptId: string;
-  threadId: string;
-  startedAt: number;
-  completedAt: number;
   model: string;
+  partKind: SessionPartKind;
   totalTokens: number;
-  estimatedApiCostUsd: number;
-}> {
-  return rows<{
-    promptId: string;
-    threadId: string;
-    startedAt: number;
-    completedAt: number;
-    model: string;
-    totalTokens: number;
-    estimatedApiCostUsd: number;
-  }>(db.prepare(`
-    WITH recent_threads AS (
-      SELECT thread_id
-      FROM prompt_metrics
-      WHERE completed_at IS NOT NULL
-      GROUP BY thread_id
-      ORDER BY MAX(completed_at) DESC
-      LIMIT ?
-    )
-    SELECT p.prompt_id AS promptId, p.thread_id AS threadId,
-           p.started_at AS startedAt, p.completed_at AS completedAt,
-           p.primary_model AS model, p.total_tokens AS totalTokens,
-           COALESCE(p.estimated_cost_usd, 0) AS estimatedApiCostUsd
-    FROM prompt_metrics p
-    JOIN recent_threads r ON r.thread_id = p.thread_id
-    WHERE p.completed_at IS NOT NULL
-    ORDER BY p.started_at ASC
-  `).all(chatLimit));
+  estimatedApiCostUsd: number | null;
 }
 
-export function getModelTokenEvents(since: number): Array<{
-  observedAt: number;
-  model: string;
-  totalTokens: number;
-  estimatedApiCostUsd: number;
-}> {
-  const primaryModels = new Map(buildThreadSummaries().map((thread) => [thread.threadId, thread.primaryModel]));
-  const result = rows<{
-    observedAt: number;
-    threadId: string;
-    partKind: SessionPartKind;
-    model: string;
-    totalTokens: number;
-    estimatedApiCostUsd: number;
-  }>(db.prepare(`
-    SELECT e.observed_at AS observedAt, e.thread_id AS threadId,
-           p.part_kind AS partKind, e.model, e.total_tokens AS totalTokens,
-           COALESCE(e.estimated_cost_usd, 0) AS estimatedApiCostUsd
+/** Token events inside a time range, joined with the kind of session that produced them. */
+export function getTokenEventsBetween(start: number, end: number): TokenEventRow[] {
+  return rows<TokenEventRow>(db.prepare(`
+    SELECT e.observed_at AS observedAt, e.thread_id AS threadId, e.model,
+           p.part_kind AS partKind, e.total_tokens AS totalTokens,
+           e.estimated_cost_usd AS estimatedApiCostUsd
     FROM session_part_token_events e
     JOIN session_parts p ON p.source_file = e.source_file
-    WHERE e.observed_at >= ?
+    WHERE e.observed_at >= ? AND e.observed_at <= ?
     ORDER BY e.observed_at ASC
-  `).all(since));
+  `).all(start, end));
+}
 
-  return result.map((event) => ({
-    observedAt: event.observedAt,
-    model: event.partKind === 'reviewer' || event.model === 'codex-auto-review'
-      ? primaryModels.get(event.threadId) ?? event.model
-      : event.model,
-    totalTokens: event.totalTokens,
-    estimatedApiCostUsd: event.estimatedApiCostUsd
-  }));
+export interface PromptRunRow {
+  threadId: string;
+  startedAt: number;
+  completedAt: number;
+  primaryModel: string;
+}
+
+/** Completed prompt runs overlapping a time range. */
+export function getPromptRunsBetween(start: number, end: number): PromptRunRow[] {
+  return rows<PromptRunRow>(db.prepare(`
+    SELECT thread_id AS threadId, started_at AS startedAt, completed_at AS completedAt,
+           primary_model AS primaryModel
+    FROM prompt_metrics
+    WHERE completed_at IS NOT NULL AND completed_at >= ? AND started_at <= ?
+    ORDER BY started_at ASC
+  `).all(start, end));
+}
+
+/** Tokens by local weekday (0 = Sunday) and hour of day for the last `days` days. */
+export function getHourlyActivity(days = 30): number[][] {
+  const since = Math.floor(Date.now() / 1000) - days * 86400;
+  const grid: number[][] = Array.from({ length: 7 }, () => Array.from({ length: 24 }, () => 0));
+  const result = rows<{ weekday: string; hour: string; tokens: number }>(db.prepare(`
+    SELECT strftime('%w', observed_at, 'unixepoch', 'localtime') AS weekday,
+           strftime('%H', observed_at, 'unixepoch', 'localtime') AS hour,
+           SUM(total_tokens) AS tokens
+    FROM session_part_token_events
+    WHERE observed_at >= ?
+    GROUP BY weekday, hour
+  `).all(since));
+  for (const row of result) {
+    const weekday = Number(row.weekday);
+    const hour = Number(row.hour);
+    if (Number.isInteger(weekday) && Number.isInteger(hour)) grid[weekday][hour] = row.tokens;
+  }
+  return grid;
 }
 
 export function getModelUsageSummaries(): ModelUsageSummary[] {
@@ -777,6 +947,79 @@ export function getModelUsageSummaries(): ModelUsageSummary[] {
   }));
 }
 
-export function emptyModelEfficiency(): ModelEfficiency[] {
-  return [];
+export function upsertCloudTasks(tasks: CloudTask[]): void {
+  const now = Math.floor(Date.now() / 1000);
+  const statement = db.prepare(`
+    INSERT INTO cloud_tasks (
+      task_id, title, status, updated_at, environment_label, url, is_review,
+      files_changed, lines_added, lines_removed, first_seen_at, last_seen_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(task_id) DO UPDATE SET
+      title = excluded.title,
+      status = excluded.status,
+      updated_at = COALESCE(excluded.updated_at, cloud_tasks.updated_at),
+      environment_label = COALESCE(excluded.environment_label, cloud_tasks.environment_label),
+      url = COALESCE(excluded.url, cloud_tasks.url),
+      is_review = excluded.is_review,
+      files_changed = COALESCE(excluded.files_changed, cloud_tasks.files_changed),
+      lines_added = COALESCE(excluded.lines_added, cloud_tasks.lines_added),
+      lines_removed = COALESCE(excluded.lines_removed, cloud_tasks.lines_removed),
+      last_seen_at = excluded.last_seen_at
+  `);
+  db.exec('BEGIN IMMEDIATE;');
+  try {
+    for (const task of tasks) {
+      statement.run(
+        task.id,
+        task.title,
+        task.status,
+        task.updatedAt,
+        task.environmentLabel,
+        task.url,
+        task.isReview ? 1 : 0,
+        task.filesChanged,
+        task.linesAdded,
+        task.linesRemoved,
+        now,
+        now
+      );
+    }
+    db.exec('COMMIT;');
+  } catch (error) {
+    db.exec('ROLLBACK;');
+    throw error;
+  }
+}
+
+export function getCloudTasks(limit = 20): CloudTask[] {
+  return rows<{
+    id: string;
+    title: string;
+    status: string;
+    updatedAt: number | null;
+    environmentLabel: string | null;
+    url: string | null;
+    isReview: number;
+    filesChanged: number | null;
+    linesAdded: number | null;
+    linesRemoved: number | null;
+    firstSeenAt: number;
+  }>(db.prepare(`
+    SELECT task_id AS id, title, status, updated_at AS updatedAt,
+           environment_label AS environmentLabel, url, is_review AS isReview,
+           files_changed AS filesChanged, lines_added AS linesAdded,
+           lines_removed AS linesRemoved, first_seen_at AS firstSeenAt
+    FROM cloud_tasks
+    ORDER BY COALESCE(updated_at, first_seen_at) DESC
+    LIMIT ?
+  `).all(limit)).map((row) => ({ ...row, isReview: row.isReview === 1 }));
+}
+
+/** Cloud tasks whose last update landed inside a time range. */
+export function countCloudTasksBetween(start: number, end: number): number {
+  const row = db.prepare(`
+    SELECT COUNT(*) AS count FROM cloud_tasks
+    WHERE COALESCE(updated_at, first_seen_at) >= ? AND COALESCE(updated_at, first_seen_at) <= ?
+  `).get(start, end) as { count: number };
+  return row.count;
 }

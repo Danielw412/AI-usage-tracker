@@ -1,383 +1,172 @@
-import type { ReactNode } from 'react';
+import { useMemo } from 'react';
 import {
-  Area,
   Bar,
   BarChart,
   CartesianGrid,
-  ComposedChart,
-  Line,
-  ReferenceLine,
   ResponsiveContainer,
   Tooltip,
   XAxis,
   YAxis
 } from 'recharts';
-import type {
-  DailyUsage,
-  ModelEfficiency,
-  ModelUsageSummary,
-  ProjectionPoint
-} from '../types';
+import { compact, integer, weekdayShort } from '../format';
+import type { DailyUsage } from '../types';
 
-function compactNumber(value: number): string {
-  return new Intl.NumberFormat('en-US', {
-    notation: 'compact',
-    maximumFractionDigits: 1
-  }).format(value);
-}
-
-function timeLabel(timestamp: number, range: 'short' | 'long'): string {
-  const date = new Date(timestamp * 1000);
-  return range === 'short'
-    ? date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
-    : date.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' });
-}
-
-const tooltipStyle = {
-  background: 'var(--tooltip-bg)',
-  border: '1px solid var(--border-strong)',
-  borderRadius: 10,
-  boxShadow: 'var(--shadow-lg)',
-  color: 'var(--text-primary)',
-  fontSize: 12
-};
-
-function ChartPanel({
-  title,
-  subtitle,
-  className = '',
-  children
+function DailyTooltip({
+  active,
+  payload,
+  label
 }: {
-  title: string;
-  subtitle: string;
-  className?: string;
-  children: ReactNode;
+  active?: boolean;
+  payload?: Array<{ value?: number | string }>;
+  label?: string;
 }) {
+  if (!active || !payload || payload.length === 0) return null;
   return (
-    <section className={`chart-panel ${className}`}>
-      <div className="section-heading compact-heading">
-        <div>
-          <h3>{title}</h3>
-          <p>{subtitle}</p>
-        </div>
-      </div>
-      {children}
-    </section>
+    <div className="chart-tooltip">
+      <span>{new Date(`${label}T12:00:00`).toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' })}</span>
+      <strong>{integer(Number(payload[0]?.value ?? 0))}</strong>
+      <em>tokens</em>
+    </div>
   );
 }
 
-type TrendRow = ProjectionPoint & {
-  actual: number | null;
-  projection: number | null;
-  overLimit: number | null;
-};
-
-function buildTrendData(points: ProjectionPoint[]): TrendRow[] {
-  return points.map((point) => ({
-    ...point,
-    actual: point.projected ? null : point.usedPercent,
-    projection: point.projected ? point.usedPercent : null,
-    overLimit: !point.projected && point.usedPercent > 100 ? point.usedPercent : null
-  }));
+function fillDays(data: DailyUsage[], days: number): DailyUsage[] {
+  const byDate = new Map(data.map((row) => [row.date, row]));
+  const result: DailyUsage[] = [];
+  const today = new Date();
+  for (let offset = days - 1; offset >= 0; offset -= 1) {
+    const date = new Date(today);
+    date.setDate(today.getDate() - offset);
+    const key = date.toISOString().slice(0, 10);
+    result.push(byDate.get(key) ?? { date: key, tokens: 0, source: data[0]?.source ?? 'local' });
+  }
+  return result;
 }
 
-export function RateLimitChart({
-  title,
-  subtitle,
-  points,
-  range,
-  resetAt
-}: {
-  title: string;
-  subtitle: string;
-  points: ProjectionPoint[];
-  range: 'short' | 'long';
-  resetAt: number | null;
-}) {
-  const base = buildTrendData(points);
-  const firstProjectedIndex = base.findIndex((point) => point.projected);
-  const data = [...base];
-  if (firstProjectedIndex > 0) {
-    const previous = base[firstProjectedIndex - 1];
-    data[firstProjectedIndex - 1] = { ...previous, projection: previous.usedPercent };
-  }
-  const maxValue = Math.max(100, ...points.map((point) => point.usedPercent));
-  const maxTimestamp = Math.max(resetAt ?? 0, ...points.map((point) => point.timestamp));
-  const resetPoints = points.filter((point) => point.reset && !point.projected);
+export function DailyTokenChart({ data, days = 14 }: { data: DailyUsage[]; days?: number }) {
+  const rows = useMemo(() => fillDays(data, days), [data, days]);
+  const total = rows.reduce((sum, row) => sum + row.tokens, 0);
+  const peak = rows.reduce((best, row) => (row.tokens > best.tokens ? row : best), rows[0]);
 
   return (
-    <section className="usage-chart-panel">
-      <div className="section-heading">
+    <section className="panel chart-panel" aria-labelledby="daily-title">
+      <header className="panel-head">
         <div>
-          <h2>{title}</h2>
-          <p>{subtitle}</p>
+          <h3 id="daily-title">Daily tokens</h3>
+          <p>{`Last ${days} days${data[0]?.source === 'account' ? ', account totals' : ', local logs'}`}</p>
         </div>
-      </div>
-      {points.length < 2 ? (
-        <div className="chart-empty">More snapshots are needed before a trend can be drawn.</div>
+        <div className="panel-figure">
+          <strong>{compact(total)}</strong>
+          <span>tokens</span>
+        </div>
+      </header>
+      {total === 0 ? (
+        <div className="chart-empty">No daily token history yet.</div>
       ) : (
-        <div className="chart-frame primary-chart">
+        <div className="chart-frame chart-frame-sm">
           <ResponsiveContainer width="100%" height="100%">
-            <ComposedChart data={data} margin={{ top: 22, right: 18, bottom: 0, left: -10 }}>
-              <defs>
-                <linearGradient id={`usageFill-${range}`} x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor="var(--chart-primary)" stopOpacity={0.32} />
-                  <stop offset="100%" stopColor="var(--chart-primary)" stopOpacity={0.015} />
-                </linearGradient>
-              </defs>
-              <CartesianGrid stroke="var(--grid-line)" vertical={false} />
+            <BarChart data={rows} margin={{ top: 8, right: 8, bottom: 0, left: 0 }} barCategoryGap={4}>
+              <CartesianGrid stroke="var(--grid)" vertical={false} />
               <XAxis
-                dataKey="timestamp"
-                type="number"
-                domain={['dataMin', maxTimestamp]}
-                tickFormatter={(value) => timeLabel(value, range)}
-                tick={{ fill: 'var(--text-muted)', fontSize: 11 }}
+                dataKey="date"
+                tickFormatter={(value) => new Date(`${value}T12:00:00`).toLocaleDateString([], { day: 'numeric', month: 'short' })}
+                tick={{ fill: 'var(--ink-3)', fontSize: 11 }}
                 axisLine={false}
                 tickLine={false}
-                minTickGap={40}
+                minTickGap={24}
               />
               <YAxis
-                domain={[0, Math.ceil(maxValue / 20) * 20]}
-                tickFormatter={(value) => `${value}%`}
-                tick={{ fill: 'var(--text-muted)', fontSize: 11 }}
+                tickFormatter={(value) => compact(Number(value), 0)}
+                tick={{ fill: 'var(--ink-3)', fontSize: 11 }}
                 axisLine={false}
                 tickLine={false}
                 width={44}
               />
-              <Tooltip
-                contentStyle={tooltipStyle}
-                labelFormatter={(value) => new Date(Number(value) * 1000).toLocaleString()}
-                formatter={(value, name) => [
-                  `${Number(value).toFixed(1)}%`,
-                  name === 'projection' ? 'Projected' : name === 'overLimit' ? 'Over limit' : 'Reported'
-                ]}
-              />
-              <ReferenceLine
-                y={100}
-                stroke="var(--danger)"
-                strokeDasharray="4 6"
-                opacity={0.72}
-                label={{ value: '100% limit', fill: 'var(--danger)', fontSize: 10, position: 'insideTopLeft' }}
-              />
-              {resetPoints.map((point) => (
-                <ReferenceLine
-                  key={`reset-${point.timestamp}`}
-                  x={point.timestamp}
-                  stroke="var(--info)"
-                  strokeDasharray="3 5"
-                  opacity={0.72}
-                  label={{ value: 'Reset detected', fill: 'var(--info)', fontSize: 10, position: 'insideTopRight' }}
-                />
-              ))}
-              {resetAt ? (
-                <ReferenceLine
-                  x={resetAt}
-                  stroke="var(--info)"
-                  strokeDasharray="4 4"
-                  opacity={0.88}
-                  label={{ value: 'Scheduled reset', fill: 'var(--info)', fontSize: 10, position: 'insideTopRight' }}
-                />
-              ) : null}
-              <Area
-                type="linear"
-                dataKey="actual"
-                stroke="var(--chart-primary)"
-                strokeWidth={2.4}
-                fill={`url(#usageFill-${range})`}
-                connectNulls={false}
+              <Tooltip content={<DailyTooltip />} cursor={{ fill: 'var(--accent-soft)' }} />
+              <Bar
+                dataKey="tokens"
+                fill="var(--accent)"
+                radius={[4, 4, 0, 0]}
+                maxBarSize={24}
                 isAnimationActive={false}
               />
-              <Line
-                type="linear"
-                dataKey="overLimit"
-                stroke="var(--danger)"
-                strokeWidth={2.8}
-                dot={false}
-                connectNulls
-                isAnimationActive={false}
-              />
-              <Line
-                type="linear"
-                dataKey="projection"
-                stroke="var(--chart-projection)"
-                strokeWidth={2.1}
-                strokeDasharray="6 5"
-                dot={false}
-                connectNulls
-                isAnimationActive={false}
-              />
-            </ComposedChart>
+            </BarChart>
           </ResponsiveContainer>
         </div>
       )}
+      {total > 0 && peak ? (
+        <p className="panel-foot">
+          Peak {new Date(`${peak.date}T12:00:00`).toLocaleDateString([], { weekday: 'long' })} with {compact(peak.tokens)} tokens.
+        </p>
+      ) : null}
     </section>
   );
 }
 
-export function DailyTokenChart({ data }: { data: DailyUsage[] }) {
-  return (
-    <ChartPanel
-      title="Daily token activity"
-      subtitle="Account totals when available, otherwise local sessions."
-    >
-      {data.length === 0 ? (
-        <div className="chart-empty">No daily token history was returned yet.</div>
-      ) : (
-        <div className="chart-frame compact-chart">
-          <ResponsiveContainer width="100%" height="100%">
-            <BarChart data={data} margin={{ top: 8, right: 8, bottom: 0, left: -10 }}>
-              <CartesianGrid stroke="var(--grid-line)" vertical={false} />
-              <XAxis
-                dataKey="date"
-                tickFormatter={(value) =>
-                  new Date(`${value}T12:00:00`).toLocaleDateString([], { weekday: 'short' })
-                }
-                tick={{ fill: 'var(--text-muted)', fontSize: 11 }}
-                axisLine={false}
-                tickLine={false}
-              />
-              <YAxis
-                tickFormatter={compactNumber}
-                tick={{ fill: 'var(--text-muted)', fontSize: 11 }}
-                axisLine={false}
-                tickLine={false}
-                width={48}
-              />
-              <Tooltip
-                contentStyle={tooltipStyle}
-                labelFormatter={(value) => new Date(`${value}T12:00:00`).toLocaleDateString()}
-                formatter={(value) => [Number(value).toLocaleString(), 'Tokens']}
-              />
-              <Bar dataKey="tokens" fill="var(--chart-primary)" radius={[5, 5, 1, 1]} maxBarSize={32} />
-            </BarChart>
-          </ResponsiveContainer>
-        </div>
-      )}
-    </ChartPanel>
-  );
-}
+const HOURS = Array.from({ length: 24 }, (_, hour) => hour);
+const DAY_ORDER = [1, 2, 3, 4, 5, 6, 0];
 
-export function ModelEfficiencyChart({ data }: { data: ModelEfficiency[] }) {
-  const rows = data
-    .filter((row) => row.minutesPerPercent !== null)
-    .sort((a, b) => (b.minutesPerPercent ?? 0) - (a.minutesPerPercent ?? 0))
-    .slice(0, 7);
-  return (
-    <ChartPanel
-      title="Model efficiency"
-      subtitle="Last 30 chats · completed task minutes per 1% of quota. Higher is better."
-    >
-      {rows.length === 0 ? (
-        <div className="chart-empty">More correlated quota samples are needed.</div>
-      ) : (
-        <div className="chart-frame compact-chart">
-          <ResponsiveContainer width="100%" height="100%">
-            <BarChart data={rows} layout="vertical" margin={{ top: 4, right: 20, bottom: 0, left: 12 }}>
-              <CartesianGrid stroke="var(--grid-line)" horizontal={false} />
-              <XAxis
-                type="number"
-                tickFormatter={(value) => `${value}m`}
-                tick={{ fill: 'var(--text-muted)', fontSize: 11 }}
-                axisLine={false}
-                tickLine={false}
-              />
-              <YAxis
-                type="category"
-                dataKey="model"
-                width={118}
-                tick={{ fill: 'var(--text-secondary)', fontSize: 11 }}
-                axisLine={false}
-                tickLine={false}
-              />
-              <Tooltip
-                contentStyle={tooltipStyle}
-                formatter={(value) => [`${Number(value).toFixed(2)} min`, 'Minutes per 1%']}
-              />
-              <Bar dataKey="minutesPerPercent" fill="var(--chart-secondary)" radius={[0, 5, 5, 0]} maxBarSize={18} />
-            </BarChart>
-          </ResponsiveContainer>
-        </div>
-      )}
-    </ChartPanel>
-  );
-}
+export function ActivityHeatmap({ grid }: { grid: number[][] }) {
+  const max = Math.max(0, ...grid.flat());
+  const total = grid.flat().reduce((sum, value) => sum + value, 0);
+  const busiest = useMemo(() => {
+    let best = { day: 0, hour: 0, tokens: 0 };
+    grid.forEach((row, day) => row.forEach((tokens, hour) => {
+      if (tokens > best.tokens) best = { day, hour, tokens };
+    }));
+    return best;
+  }, [grid]);
+  const hourTotals = HOURS.map((hour) => grid.reduce((sum, row) => sum + (row[hour] ?? 0), 0));
+  const busiestHour = hourTotals.indexOf(Math.max(...hourTotals));
 
-export function ModelTokenChart({ data }: { data: ModelUsageSummary[] }) {
-  const rows = data.slice(0, 7).map((row) => ({
-    ...row,
-    cached: row.cachedInputTokens,
-    uncached: Math.max(0, row.inputTokens - row.cachedInputTokens),
-    output: row.outputTokens
-  }));
   return (
-    <ChartPanel title="Tokens by model" subtitle="Cached input, uncached input, and output text tokens.">
-      {rows.length === 0 ? (
-        <div className="chart-empty">No model token data is available.</div>
+    <section className="panel chart-panel" aria-labelledby="heatmap-title">
+      <header className="panel-head">
+        <div>
+          <h3 id="heatmap-title">When you use Codex</h3>
+          <p>Tokens by weekday and hour, last 30 days</p>
+        </div>
+        {total > 0 ? (
+          <div className="panel-figure">
+            <strong>{`${busiestHour % 12 || 12}${busiestHour < 12 ? 'am' : 'pm'}`}</strong>
+            <span>busiest hour</span>
+          </div>
+        ) : null}
+      </header>
+      {total === 0 ? (
+        <div className="chart-empty">No local token events in the last 30 days.</div>
       ) : (
-        <div className="chart-frame compact-chart">
-          <ResponsiveContainer width="100%" height="100%">
-            <BarChart data={rows} margin={{ top: 8, right: 8, bottom: 0, left: -4 }}>
-              <CartesianGrid stroke="var(--grid-line)" vertical={false} />
-              <XAxis
-                dataKey="model"
-                tick={{ fill: 'var(--text-muted)', fontSize: 10 }}
-                axisLine={false}
-                tickLine={false}
-                interval={0}
-              />
-              <YAxis
-                tickFormatter={compactNumber}
-                tick={{ fill: 'var(--text-muted)', fontSize: 11 }}
-                axisLine={false}
-                tickLine={false}
-                width={50}
-              />
-              <Tooltip contentStyle={tooltipStyle} formatter={(value, name) => [compactNumber(Number(value)), name]} />
-              <Bar dataKey="cached" stackId="tokens" fill="var(--chart-primary)" />
-              <Bar dataKey="uncached" stackId="tokens" fill="var(--chart-secondary)" />
-              <Bar dataKey="output" stackId="tokens" fill="var(--warning)" radius={[4, 4, 0, 0]} />
-            </BarChart>
-          </ResponsiveContainer>
+        <div className="heatmap" role="img" aria-label="Token activity by weekday and hour">
+          <div className="heatmap-hours" aria-hidden="true">
+            <span />
+            {HOURS.map((hour) => (
+              <span key={hour}>{hour % 6 === 0 ? `${hour % 12 || 12}${hour < 12 ? 'a' : 'p'}` : ''}</span>
+            ))}
+          </div>
+          {DAY_ORDER.map((day) => (
+            <div className="heatmap-row" key={day}>
+              <span className="heatmap-day">{weekdayShort(day)}</span>
+              {HOURS.map((hour) => {
+                const tokens = grid[day]?.[hour] ?? 0;
+                const level = max > 0 ? Math.sqrt(tokens / max) : 0;
+                return (
+                  <span
+                    key={hour}
+                    className="heatmap-cell"
+                    style={{ opacity: tokens > 0 ? 0.14 + level * 0.86 : 1, background: tokens > 0 ? 'var(--accent)' : 'var(--bg)' }}
+                    title={`${weekdayShort(day)} ${hour}:00, ${integer(tokens)} tokens`}
+                  />
+                );
+              })}
+            </div>
+          ))}
         </div>
       )}
-    </ChartPanel>
-  );
-}
-
-export function ModelCostChart({ data }: { data: ModelUsageSummary[] }) {
-  const rows = data.filter((row) => row.estimatedApiCostUsd > 0).slice(0, 7);
-  return (
-    <ChartPanel title="API equivalent by model" subtitle="Estimated public API price for observed text tokens.">
-      {rows.length === 0 ? (
-        <div className="chart-empty">No priced model usage is available.</div>
-      ) : (
-        <div className="chart-frame compact-chart">
-          <ResponsiveContainer width="100%" height="100%">
-            <BarChart data={rows} margin={{ top: 8, right: 8, bottom: 0, left: -4 }}>
-              <CartesianGrid stroke="var(--grid-line)" vertical={false} />
-              <XAxis
-                dataKey="model"
-                tick={{ fill: 'var(--text-muted)', fontSize: 10 }}
-                axisLine={false}
-                tickLine={false}
-                interval={0}
-              />
-              <YAxis
-                tickFormatter={(value) => `$${value}`}
-                tick={{ fill: 'var(--text-muted)', fontSize: 11 }}
-                axisLine={false}
-                tickLine={false}
-                width={48}
-              />
-              <Tooltip
-                contentStyle={tooltipStyle}
-                formatter={(value) => [`$${Number(value).toFixed(3)}`, 'API equivalent']}
-              />
-              <Bar dataKey="estimatedApiCostUsd" fill="var(--info)" radius={[5, 5, 1, 1]} maxBarSize={34} />
-            </BarChart>
-          </ResponsiveContainer>
-        </div>
-      )}
-    </ChartPanel>
+      {total > 0 ? (
+        <p className="panel-foot">
+          Busiest slot: {weekdayShort(busiest.day)} at {busiest.hour}:00 with {compact(busiest.tokens)} tokens.
+        </p>
+      ) : null}
+    </section>
   );
 }

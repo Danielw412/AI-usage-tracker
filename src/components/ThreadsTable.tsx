@@ -1,271 +1,238 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { ChevronRight, Search } from 'lucide-react';
 import {
-  ChevronDown,
-  ChevronRight,
-  CircleDollarSign,
-  Clock3,
-  FolderOpen,
-  Gauge,
-  MessageSquareText,
-  Search,
-  ShieldCheck,
-  SlidersHorizontal,
-  TimerReset,
-  Zap
-} from 'lucide-react';
-import type { PromptMetric, ThreadSummary } from '../types';
+  SOURCE_LABELS,
+  compact,
+  dateTime,
+  duration,
+  modelLabel,
+  percent,
+  readableProject,
+  relativeTime,
+  usd
+} from '../format';
 
-type ThreadFilter = 'all' | 'over-limit';
-type ThreadSort = 'recent' | 'usage' | 'tokens' | 'cost';
+const PAGE_SIZE = 25;
+import type { PromptMetric, ThreadSummary, ThreadWindowUsage } from '../types';
 
-function compact(value: number): string {
-  return new Intl.NumberFormat('en-US', {
-    notation: 'compact',
-    maximumFractionDigits: 2
-  }).format(value);
-}
+type ThreadFilter = 'all' | 'interactive' | 'scripts';
+type ThreadSort = 'recent' | 'five' | 'seven' | 'tokens' | 'cost';
 
-function formatTime(timestamp: number | null): string {
-  if (!timestamp) return 'Unknown';
-  return new Date(timestamp * 1000).toLocaleString([], {
-    month: 'short',
-    day: 'numeric',
-    hour: 'numeric',
-    minute: '2-digit'
-  });
-}
-
-function formatDuration(milliseconds: number | null): string {
-  if (milliseconds === null) return '—';
-  if (milliseconds < 1000) return `${Math.round(milliseconds)} ms`;
-  const seconds = milliseconds / 1000;
-  if (seconds < 60) return `${seconds.toFixed(seconds < 10 ? 1 : 0)} sec`;
-  const minutes = Math.floor(seconds / 60);
-  const remaining = Math.round(seconds % 60);
-  if (minutes < 60) return remaining > 0 ? `${minutes}m ${remaining}s` : `${minutes}m`;
-  const hours = Math.floor(minutes / 60);
-  return `${hours}h ${minutes % 60}m`;
-}
-
-function formatUsage(value: number | null): string {
-  if (value === null) return '—';
-  if (value < 0.05) return '<0.1%';
-  return `~${value.toFixed(value < 10 ? 1 : 0)}%`;
-}
+const INTERACTIVE_SOURCES = new Set(['desktop', 'cli', 'voice', 'unknown']);
 
 function average(values: Array<number | null>): number | null {
   const valid = values.filter((value): value is number => value !== null);
   return valid.length > 0 ? valid.reduce((sum, value) => sum + value, 0) / valid.length : null;
 }
 
-function projectName(path: string | null): string {
-  if (!path) return 'Unknown project';
-  const parts = path.split(/[\\/]/).filter(Boolean);
-  return parts.at(-1) ?? path;
+function usageValue(usage: ThreadWindowUsage | null): number {
+  return usage ? usage.percent : -1;
 }
 
-function primaryUsage(thread: ThreadSummary): number | null {
-  return thread.estimatedSevenDayUsagePercent ?? thread.estimatedFiveHourUsagePercent;
-}
-
-function estimateNote(usage: number | null, windowLabel: string): string {
-  if (usage === null) return `${windowLabel} · Awaiting bracket`;
-  return `${windowLabel} · Timestamp estimate`;
-}
-
-function TokenDistribution({
-  input,
-  cached,
-  output
-}: {
-  input: number;
-  cached: number;
-  output: number;
-}) {
-  const uncached = Math.max(0, input - cached);
-  const denominator = Math.max(1, uncached + cached + output);
-  const rows = [
-    { label: 'Cached', value: cached, className: 'cached' },
-    { label: 'Uncached', value: uncached, className: 'uncached' },
-    { label: 'Output', value: output, className: 'output' }
-  ];
-
+function UsageCell({ usage }: { usage: ThreadWindowUsage | null }) {
+  if (!usage) return <span className="usage-cell muted">-</span>;
+  const stale = !usage.current;
+  const unmeasured = usage.percent === 0 && usage.coverage < 0.05;
+  const pending = unmeasured && !stale;
+  const partial = !unmeasured && usage.coverage < 0.9;
+  const label = pending
+    ? 'pending'
+    : unmeasured
+      ? '<1%'
+      : usage.percent > 0 && usage.percent < 0.05
+        ? '<0.1%'
+        : percent(usage.percent);
+  const title = [
+    stale ? `From the window that ended ${dateTime(usage.windowResetsAt)}` : 'Current window',
+    unmeasured
+      ? 'The limit did not move by a full percent while this chat was the only activity'
+      : `${Math.round(usage.coverage * 100)}% of this chat's tokens were bracketed by quota samples`,
+    usage.sharedPercent > 0 ? `${percent(usage.sharedPercent)} earned while other chats were running` : null
+  ].filter(Boolean).join('. ');
   return (
-    <div className="distribution-block">
-      <div className="detail-block-heading">
-        <span>Token distribution</span>
-        <strong>{compact(input + output)} billable</strong>
-      </div>
-      <div className="distribution-track" aria-label="Token distribution">
-        {rows.map((row) => (
-          <span
-            key={row.label}
-            className={`distribution-segment ${row.className}`}
-            style={{ width: `${(row.value / denominator) * 100}%` }}
-            title={`${row.label}: ${row.value.toLocaleString()}`}
-          />
-        ))}
-      </div>
-      <div className="distribution-legend">
-        {rows.map((row) => (
-          <div key={row.label}>
-            <i className={`legend-dot ${row.className}`} />
-            <span>{row.label}</span>
-            <strong>{compact(row.value)}</strong>
-            <small>{((row.value / denominator) * 100).toFixed(1)}%</small>
-          </div>
-        ))}
-      </div>
-    </div>
+    <span className={`usage-cell ${stale ? 'is-stale' : ''} ${unmeasured ? 'muted' : ''}`} title={title}>
+      <strong>{label}</strong>
+      {partial ? <small>{Math.round(usage.coverage * 100)}% covered</small> : null}
+      {!partial && stale ? <small>prior window</small> : null}
+    </span>
   );
 }
 
 function PromptRow({ prompt }: { prompt: PromptMetric }) {
   return (
-    <article className="prompt-row">
+    <li className="prompt-row">
       <span className="prompt-index">{prompt.sequence}</span>
       <div className="prompt-copy">
-        <strong title={prompt.prompt}>{prompt.prompt}</strong>
-        <span>{formatTime(prompt.startedAt)}</span>
+        <p title={prompt.prompt}>{prompt.prompt}</p>
+        <span>{dateTime(prompt.startedAt)} · {modelLabel(prompt.primaryModel)}</span>
       </div>
-      <span className="model-label">{prompt.primaryModel}</span>
-      <div className="prompt-metric">
-        <span>Active span</span>
-        <strong>{formatDuration(prompt.durationMs)}</strong>
-        {prompt.timingEstimated ? <small>derived</small> : null}
-      </div>
-      <div className="prompt-metric">
-        <span>First token</span>
-        <strong>{formatDuration(prompt.timeToFirstTokenMs)}</strong>
-      </div>
-      <div className="prompt-metric">
-        <span>Tokens</span>
-        <strong>{compact(prompt.totalTokens)}</strong>
-      </div>
-      <div className="prompt-metric">
-        <span>API equivalent</span>
-        <strong>
-          {prompt.estimatedApiCostUsd === null ? 'Unknown' : `$${prompt.estimatedApiCostUsd.toFixed(3)}`}
-        </strong>
-      </div>
-    </article>
+      <dl className="prompt-metrics">
+        <div><dt>Active</dt><dd>{duration(prompt.durationMs)}{prompt.timingEstimated && prompt.durationMs !== null ? '*' : ''}</dd></div>
+        <div><dt>First token</dt><dd>{duration(prompt.timeToFirstTokenMs)}</dd></div>
+        <div><dt>Tokens</dt><dd>{compact(prompt.totalTokens)}</dd></div>
+        <div><dt>API eq.</dt><dd>{prompt.estimatedApiCostUsd === null ? '-' : usd(prompt.estimatedApiCostUsd, 3)}</dd></div>
+      </dl>
+    </li>
   );
 }
 
-function ExpandedThread({ thread }: { thread: ThreadSummary }) {
+function ThreadDetail({ thread, now }: { thread: ThreadSummary; now: number }) {
+  const uncached = Math.max(0, thread.inputTokens - thread.cachedInputTokens);
+  const stackTotal = Math.max(1, thread.cachedInputTokens + uncached + thread.outputTokens);
   const totalPromptMs = thread.prompts.reduce((sum, prompt) => sum + (prompt.durationMs ?? 0), 0);
   const averageTtft = average(thread.prompts.map((prompt) => prompt.timeToFirstTokenMs));
   const tokensPerMinute = totalPromptMs > 0 ? thread.totalTokens / (totalPromptMs / 60_000) : null;
-  const cacheHit = thread.inputTokens > 0
-    ? (thread.cachedInputTokens / thread.inputTokens) * 100
-    : 0;
+  const anyEstimated = thread.prompts.some((prompt) => prompt.timingEstimated && prompt.durationMs !== null);
+  const stack = [
+    { label: 'Cached input', value: thread.cachedInputTokens, color: 'var(--ramp-1)' },
+    { label: 'Fresh input', value: uncached, color: 'var(--ramp-2)' },
+    { label: 'Output', value: thread.outputTokens, color: 'var(--ramp-3)' }
+  ];
 
-  const metrics = [
-    { label: 'Prompts', value: thread.prompts.length.toString(), Icon: MessageSquareText },
-    { label: 'Measured span', value: formatDuration(totalPromptMs || null), Icon: Clock3 },
-    { label: 'First token', value: formatDuration(averageTtft), Icon: Zap },
-    { label: 'Tokens / min', value: tokensPerMinute === null ? '—' : compact(tokensPerMinute), Icon: Gauge },
-    { label: 'Cache hit', value: `${cacheHit.toFixed(1)}%`, Icon: TimerReset },
-    { label: 'Review overhead', value: compact(thread.reviewerTokens), Icon: ShieldCheck }
+  const usageRows = [
+    { label: '5-hour share', usage: thread.usage.fiveHour },
+    { label: '7-day share', usage: thread.usage.sevenDay }
   ];
 
   return (
-    <div className="chat-detail">
-      <div className="chat-detail-top">
-        <TokenDistribution
-          input={thread.inputTokens}
-          cached={thread.cachedInputTokens}
-          output={thread.outputTokens}
-        />
-        <div className="detail-metrics">
-          <div className="detail-block-heading">
-            <span>Prompt-level timing</span>
-            <strong>{thread.prompts.length} segments</strong>
-          </div>
-          <div className="detail-metric-grid">
-            {metrics.map(({ label, value, Icon }) => (
-              <div key={label}>
-                <Icon size={14} />
-                <span>{label}</span>
-                <strong>{value}</strong>
-              </div>
+    <div className="thread-detail">
+      <div className="detail-grid">
+        <div className="detail-block">
+          <h4>Tokens</h4>
+          <div className="stack-bar detail-stack">
+            {stack.map((item) => (
+              <span key={item.label} style={{ flexGrow: item.value, background: item.color }} title={`${item.label}: ${compact(item.value)}`} />
             ))}
           </div>
+          <ul className="detail-list">
+            {stack.map((item) => (
+              <li key={item.label}>
+                <i style={{ background: item.color }} aria-hidden="true" />
+                <span>{item.label}</span>
+                <b>{compact(item.value)}</b>
+                <small>{((item.value / stackTotal) * 100).toFixed(0)}%</small>
+              </li>
+            ))}
+            {thread.reviewerTokens > 0 ? (
+              <li><i className="hollow" aria-hidden="true" /><span>Auto-review overhead</span><b>{compact(thread.reviewerTokens)}</b><small>{((thread.reviewerTokens / Math.max(1, thread.totalTokens)) * 100).toFixed(0)}%</small></li>
+            ) : null}
+            {thread.subagentTokens > 0 ? (
+              <li><i className="hollow" aria-hidden="true" /><span>Subagents</span><b>{compact(thread.subagentTokens)}</b><small>{((thread.subagentTokens / Math.max(1, thread.totalTokens)) * 100).toFixed(0)}%</small></li>
+            ) : null}
+          </ul>
         </div>
-      </div>
 
-      <div className="estimate-strip">
-        <div>
-          <span>5-hour estimate</span>
-          <strong>{formatUsage(thread.estimatedFiveHourUsagePercent)}</strong>
+        <div className="detail-block">
+          <h4>Share of the limit</h4>
+          <ul className="detail-list">
+            {usageRows.map((row) => (
+              <li key={row.label}>
+                <span>{row.label}</span>
+                <b>{row.usage ? (row.usage.percent === 0 && row.usage.coverage < 0.05 ? 'pending' : percent(row.usage.percent)) : '-'}</b>
+                <small>
+                  {row.usage
+                    ? row.usage.current
+                      ? `${Math.round(row.usage.coverage * 100)}% covered`
+                      : `window ended ${relativeTime(row.usage.windowResetsAt, now * 1000)}`
+                    : 'no samples'}
+                </small>
+              </li>
+            ))}
+            {thread.usage.fiveHour && thread.usage.fiveHour.sharedPercent > 0 ? (
+              <li>
+                <span>Earned alongside other chats</span>
+                <b>{percent(thread.usage.fiveHour.sharedPercent)}</b>
+                <small>of the 5h share</small>
+              </li>
+            ) : null}
+            <li>
+              <span>Quota rises attributed</span>
+              <b>{thread.usage.fiveHour?.spans ?? thread.usage.sevenDay?.spans ?? 0}</b>
+              <small />
+            </li>
+          </ul>
         </div>
-        <div>
-          <span>7-day estimate</span>
-          <strong>{formatUsage(thread.estimatedSevenDayUsagePercent)}</strong>
+
+        <div className="detail-block">
+          <h4>Timing</h4>
+          <ul className="detail-list">
+            <li><span>Prompts</span><b>{thread.prompts.length}</b><small>{thread.userMessageCount} messages</small></li>
+            <li><span>Active time</span><b>{duration(totalPromptMs || null)}</b><small>{anyEstimated ? 'partly derived' : 'reported'}</small></li>
+            <li><span>First token</span><b>{duration(averageTtft)}</b><small>average</small></li>
+            <li><span>Tokens per minute</span><b>{tokensPerMinute === null ? '-' : compact(tokensPerMinute)}</b><small /></li>
+            <li><span>Started</span><b>{dateTime(thread.startedAt)}</b><small>{thread.partCount} session {thread.partCount === 1 ? 'file' : 'files'}</small></li>
+          </ul>
         </div>
-        <div>
-          <span>Reliable intervals</span>
-          <strong>{thread.usageSampleIntervals}</strong>
-        </div>
-        <div>
-          <span>Reset segments</span>
-          <strong>{thread.usageResetSegments || '—'}</strong>
-        </div>
-        <div>
-          <span>Session files</span>
-          <strong>{thread.partCount}</strong>
-        </div>
-        <p>
-          Completed task runs are matched to quota timestamps. Each impact is the after value minus the before value.
-        </p>
       </div>
 
       <div className="prompt-section">
-        <div className="prompt-section-heading">
-          <div>
-            <span>Prompt activity</span>
-            <strong>Timing and token use for each prompt or steering message</strong>
-          </div>
-        </div>
+        <h4>Prompts</h4>
         {thread.prompts.length === 0 ? (
-          <div className="prompt-empty">Prompt-level events were not available in this rollout.</div>
+          <p className="prompt-empty">Prompt-level events were not persisted for this chat.</p>
         ) : (
-          <div className="prompt-list">
+          <ol className="prompt-list">
             {thread.prompts.map((prompt) => <PromptRow key={prompt.promptId} prompt={prompt} />)}
-          </div>
+          </ol>
         )}
+        {anyEstimated ? <p className="prompt-note">* duration derived from log timestamps rather than reported by Codex.</p> : null}
       </div>
     </div>
   );
 }
 
-export function ThreadsTable({ threads }: { threads: ThreadSummary[] }) {
-  const [expanded, setExpanded] = useState<Set<string>>(
-    () => new Set(threads[0] ? [threads[0].threadId] : [])
-  );
+interface ThreadsTableProps {
+  threads: ThreadSummary[];
+  colors: Map<string, string>;
+  selectedThreadId: string | null;
+  now: number;
+}
+
+export function ThreadsTable({ threads, colors, selectedThreadId, now }: ThreadsTableProps) {
+  const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
   const [query, setQuery] = useState('');
   const [filter, setFilter] = useState<ThreadFilter>('all');
   const [sort, setSort] = useState<ThreadSort>('recent');
+  const [limit, setLimit] = useState(PAGE_SIZE);
+  const rowRefs = useRef(new Map<string, HTMLElement>());
 
-  const visibleThreads = useMemo(() => {
-    const normalizedQuery = query.trim().toLowerCase();
-    const filtered = threads.filter((thread) => {
-      const matchesQuery = !normalizedQuery || [
-        thread.title,
-        thread.projectPath ?? '',
-        projectName(thread.projectPath),
-        thread.primaryModel
-      ].some((value) => value.toLowerCase().includes(normalizedQuery));
-      if (!matchesQuery) return false;
-      if (filter === 'over-limit') {
-        return (thread.estimatedFiveHourUsagePercent ?? 0) > 100 ||
-          (thread.estimatedSevenDayUsagePercent ?? 0) > 100;
-      }
-      return true;
+  useEffect(() => {
+    if (!selectedThreadId) return;
+    setExpanded((current) => new Set(current).add(selectedThreadId));
+    setFilter('all');
+    setQuery('');
+    setSort('recent');
+    setLimit((current) => {
+      const index = threads.findIndex((thread) => thread.threadId === selectedThreadId);
+      return index >= current ? Math.ceil((index + 1) / PAGE_SIZE) * PAGE_SIZE : current;
     });
+    window.setTimeout(() => {
+      rowRefs.current.get(selectedThreadId)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }, 60);
+  }, [selectedThreadId, threads]);
 
+  useEffect(() => {
+    setLimit(PAGE_SIZE);
+  }, [filter, query, sort]);
+
+  const visible = useMemo(() => {
+    const normalized = query.trim().toLowerCase();
+    const filtered = threads.filter((thread) => {
+      if (filter === 'interactive' && !INTERACTIVE_SOURCES.has(thread.source)) return false;
+      if (filter === 'scripts' && thread.source !== 'exec') return false;
+      if (!normalized) return true;
+      return [
+        thread.title,
+        thread.preview ?? '',
+        thread.projectName ?? '',
+        thread.projectPath ?? '',
+        thread.primaryModel,
+        thread.sourceLabel ?? '',
+        thread.gitBranch ?? ''
+      ].some((value) => value.toLowerCase().includes(normalized));
+    });
     return [...filtered].sort((a, b) => {
-      if (sort === 'usage') return (primaryUsage(b) ?? -1) - (primaryUsage(a) ?? -1);
+      if (sort === 'five') return usageValue(b.usage.fiveHour) - usageValue(a.usage.fiveHour);
+      if (sort === 'seven') return usageValue(b.usage.sevenDay) - usageValue(a.usage.sevenDay);
       if (sort === 'tokens') return b.totalTokens - a.totalTokens;
       if (sort === 'cost') return (b.estimatedApiCostUsd ?? -1) - (a.estimatedApiCostUsd ?? -1);
       return (b.updatedAt ?? b.startedAt ?? 0) - (a.updatedAt ?? a.startedAt ?? 0);
@@ -282,28 +249,25 @@ export function ThreadsTable({ threads }: { threads: ThreadSummary[] }) {
   };
 
   return (
-    <section className="threads-panel" id="chats" aria-labelledby="recent-chats-title">
-      <div className="threads-heading">
+    <section className="section" id="chats" aria-labelledby="chats-title">
+      <header className="section-head with-tools">
         <div>
-          <h2 id="recent-chats-title">Recent chats</h2>
-          <p>Real chat names, quota estimates, and prompt-level detail.</p>
+          <h2 id="chats-title">Chats</h2>
+          <p>Every chat found in your local logs, with its share of each limit.</p>
         </div>
-        <div className="thread-toolbar">
-          <label className="search-control">
-            <Search size={16} />
-            <span className="sr-only">Search chats or projects</span>
+        <div className="toolbar">
+          <label className="search-field">
+            <Search size={15} strokeWidth={1.75} aria-hidden="true" />
+            <span className="sr-only">Search chats</span>
             <input
               type="search"
               value={query}
               onChange={(event) => setQuery(event.target.value)}
-              placeholder="Search chats or projects"
+              placeholder="Search chats, projects, models"
             />
           </label>
-          <div className="filter-control" aria-label="Filter chats">
-            {([
-              ['all', 'All'],
-              ['over-limit', 'Over limit']
-            ] as const).map(([value, label]) => (
+          <div className="segmented" role="group" aria-label="Filter chats">
+            {([['all', 'All'], ['interactive', 'Interactive'], ['scripts', 'Scripts']] as const).map(([value, label]) => (
               <button
                 key={value}
                 type="button"
@@ -315,102 +279,99 @@ export function ThreadsTable({ threads }: { threads: ThreadSummary[] }) {
               </button>
             ))}
           </div>
-          <label className="sort-control">
-            <SlidersHorizontal size={15} />
+          <label className="select-field">
             <span className="sr-only">Sort chats</span>
             <select value={sort} onChange={(event) => setSort(event.target.value as ThreadSort)}>
-              <option value="recent">Recent</option>
-              <option value="usage">Quota impact</option>
+              <option value="recent">Most recent</option>
+              <option value="five">5-hour share</option>
+              <option value="seven">7-day share</option>
               <option value="tokens">Tokens</option>
               <option value="cost">API equivalent</option>
             </select>
           </label>
         </div>
-      </div>
+      </header>
 
       {threads.length === 0 ? (
-        <div className="table-empty">No chat usage has been indexed.</div>
-      ) : visibleThreads.length === 0 ? (
-        <div className="table-empty">No chats match this search and filter.</div>
+        <div className="panel chart-empty">No chat usage has been indexed yet. Start a Codex chat and refresh.</div>
+      ) : visible.length === 0 ? (
+        <div className="panel chart-empty">No chats match this search.</div>
       ) : (
-        <div className="chat-list">
-          <div className="chat-list-header" aria-hidden="true">
-            <span />
-            <span>Chat</span>
-            <span>Project</span>
-            <span>Model</span>
-            <span>5h impact</span>
-            <span>7d impact</span>
-            <span>Tokens</span>
-            <span>API equivalent</span>
-            <span>Last activity</span>
+        <div className="thread-table" role="table" aria-label="Chats">
+          <div className="thread-header" role="row">
+            <span aria-hidden="true" />
+            <span role="columnheader">Chat</span>
+            <span role="columnheader">Model</span>
+            <span role="columnheader" className="num">5h share</span>
+            <span role="columnheader" className="num">7d share</span>
+            <span role="columnheader" className="num">Tokens</span>
+            <span role="columnheader" className="num">API eq.</span>
+            <span role="columnheader" className="num">Active</span>
           </div>
-          {visibleThreads.map((thread) => {
+          {visible.slice(0, limit).map((thread) => {
             const isExpanded = expanded.has(thread.threadId);
-            const fiveHourUsage = thread.estimatedFiveHourUsagePercent;
-            const sevenDayUsage = thread.estimatedSevenDayUsagePercent;
+            const color = colors.get(thread.threadId);
+            const project = readableProject(thread.projectName);
             return (
               <article
-                className={`chat-item ${isExpanded ? 'expanded' : ''}`}
                 key={thread.threadId}
+                className={`thread-row ${isExpanded ? 'expanded' : ''}`}
+                ref={(node) => {
+                  if (node) rowRefs.current.set(thread.threadId, node);
+                  else rowRefs.current.delete(thread.threadId);
+                }}
               >
                 <button
                   type="button"
-                  className="chat-summary"
+                  className="thread-summary"
                   aria-expanded={isExpanded}
                   aria-controls={`detail-${thread.threadId}`}
                   onClick={() => toggle(thread.threadId)}
                 >
-                  <span className="chat-chevron">
-                    {isExpanded ? <ChevronDown size={17} /> : <ChevronRight size={17} />}
-                  </span>
-                  <span className="chat-main">
-                    <span className="chat-title-line">
-                      <strong>{thread.title}</strong>
+                  <span className="thread-chevron"><ChevronRight size={15} strokeWidth={1.75} aria-hidden="true" /></span>
+                  <span className="thread-main">
+                    <span className="thread-title">
+                      {color ? <i className="thread-swatch" style={{ background: color }} aria-hidden="true" /> : null}
+                      <span className="thread-title-text" title={thread.title}>{thread.title}</span>
                     </span>
-                    <span className="chat-mobile-meta">
-                      {projectName(thread.projectPath)} · {thread.primaryModel}
+                    <span className="thread-meta">
+                      <span className={`source-tag ${thread.source}`}>{SOURCE_LABELS[thread.source] ?? 'Local'}</span>
+                      {project ? <span>{project}</span> : null}
+                      {thread.gitBranch ? <span className="branch">{thread.gitBranch}</span> : null}
+                      {thread.titleSource === 'fallback' && thread.preview ? <span className="preview">{thread.preview}</span> : null}
                     </span>
                   </span>
-                  <span className="chat-project" title={thread.projectPath ?? undefined}>
-                    <FolderOpen size={13} /> {projectName(thread.projectPath)}
+                  <span className="thread-model">
+                    <strong>{modelLabel(thread.primaryModel)}</strong>
+                    {thread.reasoningEffort ? <small>{thread.reasoningEffort}</small> : null}
                   </span>
-                  <span className="chat-model"><i className="model-label">{thread.primaryModel}</i></span>
-                  <span className={`chat-usage chat-usage-five ${(fiveHourUsage ?? 0) > 100 ? 'over-limit' : ''}`}>
-                    <strong>{formatUsage(fiveHourUsage)}</strong>
-                    <small>{estimateNote(fiveHourUsage, '5h')}</small>
-                  </span>
-                  <span className={`chat-usage chat-usage-seven ${(sevenDayUsage ?? 0) > 100 ? 'over-limit' : ''}`}>
-                    <strong>{formatUsage(sevenDayUsage)}</strong>
-                    <small>{estimateNote(sevenDayUsage, '7d')}</small>
-                  </span>
-                  <span className="chat-tokens">
+                  <UsageCell usage={thread.usage.fiveHour} />
+                  <UsageCell usage={thread.usage.sevenDay} />
+                  <span className="thread-tokens">
                     <strong>{compact(thread.totalTokens)}</strong>
-                    <small>{compact(thread.outputTokens)} output</small>
+                    <small>{compact(thread.outputTokens)} out</small>
                   </span>
-                  <span className="chat-cost">
-                    <strong>
-                      {thread.estimatedApiCostUsd === null ? 'Unknown' : `$${thread.estimatedApiCostUsd.toFixed(2)}`}
-                    </strong>
-                    <small className={`pricing-state ${thread.pricingStatus}`}>
-                      <CircleDollarSign size={11} />
-                      {thread.pricingStatus === 'exact-model-match'
-                        ? 'Matched'
-                        : thread.pricingStatus === 'partial'
-                          ? 'Partial'
-                          : 'No price'}
-                    </small>
+                  <span className="thread-cost">
+                    <strong>{thread.estimatedApiCostUsd === null ? '-' : usd(thread.estimatedApiCostUsd)}</strong>
+                    {thread.pricingStatus === 'partial' ? <small>partly priced</small> : null}
                   </span>
-                  <span className="chat-activity">{formatTime(thread.updatedAt)}</span>
+                  <span className="thread-time" title={dateTime(thread.updatedAt)}>{relativeTime(thread.updatedAt, now * 1000)}</span>
                 </button>
                 {isExpanded ? (
                   <div id={`detail-${thread.threadId}`}>
-                    <ExpandedThread thread={thread} />
+                    <ThreadDetail thread={thread} now={now} />
                   </div>
                 ) : null}
               </article>
             );
           })}
+          {visible.length > limit ? (
+            <div className="thread-more">
+              <button type="button" className="button ghost" onClick={() => setLimit((current) => current + PAGE_SIZE)}>
+                Show {Math.min(PAGE_SIZE, visible.length - limit)} more of {visible.length - limit} remaining
+              </button>
+            </div>
+          ) : null}
         </div>
       )}
     </section>

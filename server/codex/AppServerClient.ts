@@ -165,9 +165,9 @@ export class AppServerClient extends EventEmitter {
       data: result.data.map((value) => {
         if (!isRecord(value)) return value;
         const threadId = firstString(value, ['id', 'threadId', 'thread_id']);
-        const localTitle = threadId ? localTitles.get(threadId) : null;
-        if (!localTitle || firstString(value, ['name', 'threadName', 'displayName'])) return value;
-        return { ...value, title: localTitle };
+        const localName = threadId ? localTitles.get(threadId) : null;
+        if (!localName || firstString(value, ['name', 'threadName', 'displayName'])) return value;
+        return { ...value, name: localName };
       })
     };
   }

@@ -1,14 +1,25 @@
 import {
+  countCloudTasksBetween,
+  getPromptRunsBetween,
   getRateLimitHistory,
-  getRecentChatTaskRuns,
-  getThreadTaskRuns
+  getThreadTitleMap,
+  getTokenEventsBetween,
+  type PromptRunRow,
+  type TokenEventRow
 } from './db.js';
-import { estimateThreadUsageForBank } from './threadUsage.js';
+import {
+  RESET_DROP_THRESHOLD,
+  attributeQuotaUsage,
+  coverageOf,
+  type QuotaEvent
+} from './threadUsage.js';
 import type {
   LimitProjection,
   ModelEfficiency,
   ProjectionPoint,
-  RateLimitWindow
+  RateLimitWindow,
+  ThreadWindowUsage,
+  WindowBreakdown
 } from './types.js';
 
 const EMPTY_PROJECTION: LimitProjection = {
@@ -21,7 +32,16 @@ const EMPTY_PROJECTION: LimitProjection = {
   resetEventsDetected: 0
 };
 
-const MODEL_EFFICIENCY_CHAT_LIMIT = 30;
+/** Used to weight tokens from models without a public price (auto-review). */
+const DEFAULT_COST_PER_TOKEN = 2.5 / 1_000_000;
+const MODEL_EFFICIENCY_LOOKBACK_DAYS = 15;
+const THREAD_USAGE_LOOKBACK_DAYS = 30;
+/**
+ * Sources disagree on a reset time by a few seconds, and an idle window reports
+ * a reset time that slides forward with every poll. Reset times closer together
+ * than this belong to the same bank.
+ */
+export const BANK_TOLERANCE_SECONDS = 180;
 
 function regression(points: RateLimitWindow[]): { slopePerSecond: number; spanSeconds: number } | null {
   if (points.length < 2) return null;
@@ -54,7 +74,7 @@ function splitContinuousHistory(history: RateLimitWindow[]): RateLimitWindow[][]
     const previous = current?.at(-1);
     const resetBoundary = previous && (
       point.resetsAt !== previous.resetsAt ||
-      point.usedPercent < previous.usedPercent - 0.01
+      point.usedPercent < previous.usedPercent - RESET_DROP_THRESHOLD
     );
     if (!current || resetBoundary) segments.push([point]);
     else current.push(point);
@@ -100,7 +120,11 @@ export function calculateProjection(
   }
 
   const remainingSeconds = Math.max(0, current.resetsAt - now);
-  const projected = current.usedPercent + fit.slopePerSecond * remainingSeconds;
+  // Codex stops serving requests at the limit, so the reported value cannot keep
+  // climbing once it is there. Hold the projection at the current level.
+  const projected = current.usedPercent >= 100
+    ? current.usedPercent
+    : current.usedPercent + fit.slopePerSecond * remainingSeconds;
   const projectedExhaustionAt = current.usedPercent >= 100
     ? now
     : fit.slopePerSecond > 0
@@ -148,7 +172,7 @@ export function buildChartPoints(
     usedPercent: point.usedPercent,
     reset: index > 0 && (
       point.resetsAt !== ordered[index - 1].resetsAt ||
-      point.usedPercent < ordered[index - 1].usedPercent - 0.01
+      point.usedPercent < ordered[index - 1].usedPercent - RESET_DROP_THRESHOLD
     )
   }));
   if (!current || projection.projectedPercentAtReset === null) return points;
@@ -176,14 +200,6 @@ export function buildChartPoints(
   return points;
 }
 
-interface EfficiencyAccumulator {
-  estimatedUsagePercent: number;
-  activeMinutes: number;
-  tokens: number;
-  estimatedApiCostUsd: number;
-  sampleIntervals: number;
-}
-
 function groupHistory(history: RateLimitWindow[]): RateLimitWindow[][] {
   const groups = new Map<string, RateLimitWindow[]>();
   for (const point of history) {
@@ -203,7 +219,8 @@ function groupHistory(history: RateLimitWindow[]): RateLimitWindow[][] {
   );
 }
 
-function groupWindowHistory(
+/** One sample series per reset bank, preferring the App Server source for charts. */
+export function groupWindowHistory(
   history: RateLimitWindow[],
   preferredKey: string
 ): RateLimitWindow[][] {
@@ -237,155 +254,152 @@ function groupWindowHistory(
   );
 }
 
-type RecentTaskRun = ReturnType<typeof getRecentChatTaskRuns>[number];
-
-export function estimateModelEfficiencyForHistory(
+/**
+ * Every sample for each reset bank, regardless of which source logged it. The
+ * attribution engine tolerates small disagreements between sources, and denser
+ * samples bracket work more tightly.
+ */
+export function mergedBankHistories(
   history: RateLimitWindow[],
-  taskRuns: RecentTaskRun[]
-): ModelEfficiency[] {
-  if (history.length === 0 || taskRuns.length === 0) return [];
-
-  const preferredKey = Math.abs(history[0].windowDurationMins - 300) <= 5
-    ? 'five-hour'
-    : Math.abs(history[0].windowDurationMins - 10_080) <= 60
-      ? 'seven-day'
-      : null;
-  const latest = preferredKey
-    ? [...history].reverse().find((point) => point.key === preferredKey) ?? history.at(-1)!
-    : history.at(-1)!;
-  const groups = groupWindowHistory(history, latest.key);
-  if (groups.length === 0) return [];
-
-  const reliableTotals = new Map<string, EfficiencyAccumulator>();
-  const countedRuns = new Set<string>();
-
-  for (const group of groups) {
-    if (group.length < 2) continue;
-    const firstObservedAt = group[0].observedAt;
-    const lastObservedAt = group.at(-1)!.observedAt;
-    const bankRuns = taskRuns.filter(
-      (run) =>
-        !countedRuns.has(run.promptId) &&
-        run.model !== 'unknown' &&
-        run.model !== 'codex-auto-review' &&
-        run.startedAt >= firstObservedAt &&
-        run.completedAt <= lastObservedAt
-    );
-    if (bankRuns.length === 0) continue;
-
-    const estimates = estimateThreadUsageForBank(
-      group,
-      bankRuns.map((run) => ({
-        threadId: run.model,
-        startedAt: run.startedAt,
-        completedAt: run.completedAt
-      }))
-    );
-    for (const [model, estimate] of estimates) {
-      const modelRuns = bankRuns.filter((run) => run.model === model);
-      if (modelRuns.length === 0) continue;
-      const accumulator = reliableTotals.get(model) ?? {
-        estimatedUsagePercent: 0,
-        activeMinutes: 0,
-        tokens: 0,
-        estimatedApiCostUsd: 0,
-        sampleIntervals: 0
-      };
-      accumulator.estimatedUsagePercent += estimate.percent;
-      accumulator.activeMinutes += modelRuns.reduce(
-        (sum, run) => sum + Math.max(0, run.completedAt - run.startedAt) / 60,
-        0
-      );
-      accumulator.tokens += modelRuns.reduce((sum, run) => sum + run.totalTokens, 0);
-      accumulator.estimatedApiCostUsd += modelRuns.reduce(
-        (sum, run) => sum + run.estimatedApiCostUsd,
-        0
-      );
-      accumulator.sampleIntervals += estimate.sampleIntervals;
-      reliableTotals.set(model, accumulator);
-      for (const run of modelRuns) countedRuns.add(run.promptId);
-    }
+  tolerance = BANK_TOLERANCE_SECONDS
+): Map<number, RateLimitWindow[]> {
+  const byResetsAt = new Map<number, RateLimitWindow[]>();
+  for (const point of history) {
+    const bank = byResetsAt.get(point.resetsAt) ?? [];
+    bank.push(point);
+    byResetsAt.set(point.resetsAt, bank);
   }
 
-  return [...reliableTotals.entries()]
-    .map(([model, row]) => ({
-      model,
-      ...row,
-      minutesPerPercent:
-        row.estimatedUsagePercent > 0 ? row.activeMinutes / row.estimatedUsagePercent : null
-    }))
-    .sort((a, b) => (b.minutesPerPercent ?? -1) - (a.minutesPerPercent ?? -1));
+  // Chain reset times that sit within the tolerance into one cluster.
+  const clusters: number[][] = [];
+  for (const resetsAt of [...byResetsAt.keys()].sort((a, b) => a - b)) {
+    const current = clusters.at(-1);
+    if (current && resetsAt - current[current.length - 1] <= tolerance) current.push(resetsAt);
+    else clusters.push([resetsAt]);
+  }
+
+  const banks = new Map<number, RateLimitWindow[]>();
+  for (const cluster of clusters) {
+    // The locked reset time is the one most samples agree on.
+    const canonical = cluster.reduce((best, resetsAt) =>
+      (byResetsAt.get(resetsAt)?.length ?? 0) > (byResetsAt.get(best)?.length ?? 0) ? resetsAt : best
+    );
+    const samples = cluster
+      .flatMap((resetsAt) => byResetsAt.get(resetsAt) ?? [])
+      .map((point) => ({ ...point, resetsAt: canonical }))
+      .sort((a, b) => a.observedAt - b.observedAt);
+    banks.set(canonical, samples);
+  }
+  return banks;
 }
 
-export function calculateModelEfficiency(): ModelEfficiency[] {
-  const taskRuns = getRecentChatTaskRuns(MODEL_EFFICIENCY_CHAT_LIMIT);
-  const fiveHourHistory = getRateLimitHistory(300, undefined, 15);
-  const fiveHour = estimateModelEfficiencyForHistory(fiveHourHistory, taskRuns);
-  if (fiveHour.length > 0) return fiveHour;
-
-  const sevenDayHistory = getRateLimitHistory(10_080, undefined, 30);
-  return estimateModelEfficiencyForHistory(sevenDayHistory, taskRuns);
+export function sameBank(a: number, b: number, tolerance = BANK_TOLERANCE_SECONDS): boolean {
+  return Math.abs(a - b) <= tolerance;
 }
 
-interface ThreadUsageAccumulator {
-  percent: number;
-  sampleIntervals: number;
-  resetSegments: number;
+function fallbackCostPerToken(events: TokenEventRow[]): number {
+  let cost = 0;
+  let tokens = 0;
+  for (const event of events) {
+    if (event.estimatedApiCostUsd === null) continue;
+    cost += event.estimatedApiCostUsd;
+    tokens += event.totalTokens;
+  }
+  return tokens > 0 && cost > 0 ? cost / tokens : DEFAULT_COST_PER_TOKEN;
+}
+
+export function toQuotaEvents(
+  events: TokenEventRow[],
+  keyOf: (event: TokenEventRow) => string | null,
+  costPerToken = fallbackCostPerToken(events)
+): QuotaEvent[] {
+  const result: QuotaEvent[] = [];
+  for (const event of events) {
+    const key = keyOf(event);
+    if (!key) continue;
+    const weight = event.estimatedApiCostUsd ?? event.totalTokens * costPerToken;
+    if (weight > 0) result.push({ key, observedAt: event.observedAt, weight });
+  }
+  return result;
+}
+
+function sliceEvents(events: TokenEventRow[], start: number, end: number): TokenEventRow[] {
+  // Events are sorted by observedAt; binary-search the bounds.
+  let low = 0;
+  let high = events.length;
+  while (low < high) {
+    const middle = (low + high) >> 1;
+    if (events[middle].observedAt < start) low = middle + 1;
+    else high = middle;
+  }
+  const from = low;
+  high = events.length;
+  while (low < high) {
+    const middle = (low + high) >> 1;
+    if (events[middle].observedAt <= end) low = middle + 1;
+    else high = middle;
+  }
+  return events.slice(from, low);
+}
+
+interface BankRange {
+  resetsAt: number;
+  start: number;
+  end: number;
+  samples: RateLimitWindow[];
+}
+
+function bankRanges(
+  history: RateLimitWindow[],
+  durationMins: number,
+  now: number
+): BankRange[] {
+  const ranges: BankRange[] = [];
+  for (const [resetsAt, samples] of mergedBankHistories(history)) {
+    if (samples.length < 2) continue;
+    const start = resetsAt - durationMins * 60;
+    ranges.push({ resetsAt, start, end: Math.min(resetsAt, now), samples });
+  }
+  return ranges;
 }
 
 function estimateThreadUsageForWindow(
   currentWindow: RateLimitWindow | null,
   durationMins: number,
-  lookbackDays: number
-): Map<string, ThreadUsageAccumulator> {
-  const history = getRateLimitHistory(
-    durationMins,
-    undefined,
-    lookbackDays
-  );
-  const referenceWindow = currentWindow ?? history.at(-1) ?? null;
-  if (!referenceWindow) return new Map();
-  const groups = groupWindowHistory(history, referenceWindow.key);
-  if (groups.length === 0) return new Map();
+  lookbackDays: number,
+  now: number
+): Map<string, ThreadWindowUsage> {
+  const history = getRateLimitHistory(durationMins, undefined, lookbackDays);
+  const banks = bankRanges(history, durationMins, now);
+  if (banks.length === 0) return new Map();
 
-  const durationSeconds = referenceWindow.windowDurationMins * 60;
-  const earliestBankStart = Math.min(
-    ...groups.map((group) => group[0].resetsAt - durationSeconds)
-  );
-  const taskRuns = getThreadTaskRuns(earliestBankStart);
-  const latestBankByThread = new Map<string, { resetAt: number; latestRunAt: number }>();
-  const reliableUsageByBank = new Map<number, Map<string, ThreadUsageAccumulator>>();
+  const earliest = Math.min(...banks.map((bank) => bank.start));
+  const allEvents = getTokenEventsBetween(earliest, now);
+  const costPerToken = fallbackCostPerToken(allEvents);
+  const result = new Map<string, ThreadWindowUsage>();
 
-  for (const group of groups) {
-    if (group.length < 2) continue;
-    const resetAt = group[0].resetsAt;
-    const firstObservedAt = group[0].observedAt;
-    const lastObservedAt = group.at(-1)!.observedAt;
-    const bankRuns = taskRuns.filter(
-      (run) => run.startedAt >= firstObservedAt && run.completedAt <= lastObservedAt
+  for (const bank of banks) {
+    const events = toQuotaEvents(
+      sliceEvents(allEvents, bank.start, bank.end),
+      (event) => event.threadId,
+      costPerToken
     );
-
-    for (const run of bankRuns) {
-      const previous = latestBankByThread.get(run.threadId);
-      if (
-        !previous ||
-        run.completedAt > previous.latestRunAt ||
-        (run.completedAt === previous.latestRunAt && resetAt > previous.resetAt)
-      ) {
-        latestBankByThread.set(run.threadId, {
-          resetAt,
-          latestRunAt: run.completedAt
-        });
-      }
+    if (events.length === 0) continue;
+    const attribution = attributeQuotaUsage(bank.samples, events);
+    for (const [threadId, row] of attribution.byKey) {
+      if (row.totalWeight <= 0) continue;
+      const previous = result.get(threadId);
+      // Report the most recent bank the chat was active in.
+      if (previous && previous.windowResetsAt > bank.resetsAt) continue;
+      result.set(threadId, {
+        percent: row.percent,
+        coverage: coverageOf(row),
+        sharedPercent: row.sharedPercent,
+        spans: row.spans,
+        windowResetsAt: bank.resetsAt,
+        current: currentWindow !== null && sameBank(currentWindow.resetsAt, bank.resetsAt)
+      });
     }
-
-    reliableUsageByBank.set(resetAt, estimateThreadUsageForBank(group, bankRuns));
-  }
-
-  const result = new Map<string, ThreadUsageAccumulator>();
-  for (const [threadId, latestBank] of latestBankByThread) {
-    const estimate = reliableUsageByBank.get(latestBank.resetAt)?.get(threadId);
-    if (estimate) result.set(threadId, estimate);
   }
   return result;
 }
@@ -393,25 +407,174 @@ function estimateThreadUsageForWindow(
 export function calculateThreadUsageEstimates(
   fiveHourWindow: RateLimitWindow | null,
   sevenDayWindow: RateLimitWindow | null
-): Map<string, {
-  fiveHourPercent: number | null;
-  sevenDayPercent: number | null;
-  sampleIntervals: number;
-  resetSegments: number;
-}> {
-  const fiveHour = estimateThreadUsageForWindow(fiveHourWindow, 300, 30);
-  const sevenDay = estimateThreadUsageForWindow(sevenDayWindow, 10_080, 30);
+): Map<string, { fiveHour: ThreadWindowUsage | null; sevenDay: ThreadWindowUsage | null }> {
+  const now = Math.floor(Date.now() / 1000);
+  const fiveHour = estimateThreadUsageForWindow(fiveHourWindow, 300, THREAD_USAGE_LOOKBACK_DAYS, now);
+  const sevenDay = estimateThreadUsageForWindow(sevenDayWindow, 10_080, THREAD_USAGE_LOOKBACK_DAYS, now);
   const ids = new Set([...fiveHour.keys(), ...sevenDay.keys()]);
   return new Map(
-    [...ids].map((threadId) => {
-      const short = fiveHour.get(threadId);
-      const weekly = sevenDay.get(threadId);
-      return [threadId, {
-        fiveHourPercent: short?.percent ?? null,
-        sevenDayPercent: weekly?.percent ?? null,
-        sampleIntervals: Math.max(short?.sampleIntervals ?? 0, weekly?.sampleIntervals ?? 0),
-        resetSegments: Math.max(short?.resetSegments ?? 0, weekly?.resetSegments ?? 0)
-      }];
-    })
+    [...ids].map((threadId) => [threadId, {
+      fiveHour: fiveHour.get(threadId) ?? null,
+      sevenDay: sevenDay.get(threadId) ?? null
+    }])
+  );
+}
+
+/** Where the usage in the currently reported bank came from. */
+export function calculateWindowBreakdown(
+  current: RateLimitWindow | null,
+  history: RateLimitWindow[],
+  topThreads = 8
+): WindowBreakdown | null {
+  if (!current) return null;
+  const now = Math.floor(Date.now() / 1000);
+  const banks = mergedBankHistories(history);
+  const bankKey = [...banks.keys()].find((resetsAt) => sameBank(resetsAt, current.resetsAt));
+  const samples = bankKey !== undefined ? [...banks.get(bankKey)!] : [];
+  if (!samples.some((point) => point.observedAt === current.observedAt)) {
+    samples.push({ ...current, resetsAt: bankKey ?? current.resetsAt });
+  }
+  const windowStartsAt = current.resetsAt - current.windowDurationMins * 60;
+  const rawEvents = getTokenEventsBetween(windowStartsAt, now);
+  const attribution = attributeQuotaUsage(
+    samples,
+    toQuotaEvents(rawEvents, (event) => event.threadId)
+  );
+  const titles = getThreadTitleMap();
+  const threads = [...attribution.byKey.entries()]
+    .filter(([, row]) => row.percent > 0)
+    .sort((a, b) => b[1].percent - a[1].percent)
+    .slice(0, topThreads)
+    .map(([threadId, row]) => ({
+      threadId,
+      title: titles.get(threadId)?.title ?? 'Untitled chat',
+      model: titles.get(threadId)?.model ?? 'unknown',
+      percent: row.percent,
+      coverage: coverageOf(row)
+    }));
+  const listed = new Set(threads.map((thread) => thread.threadId));
+  const activity = getPromptRunsBetween(windowStartsAt, now)
+    .filter((run) => listed.has(run.threadId))
+    .slice(0, 400)
+    .map((run) => ({
+      threadId: run.threadId,
+      startedAt: Math.max(run.startedAt, windowStartsAt),
+      completedAt: Math.min(run.completedAt, now)
+    }));
+
+  return {
+    resetsAt: current.resetsAt,
+    windowStartsAt,
+    observedDeltaPercent: attribution.observedDeltaPercent,
+    attributedPercent: attribution.attributedPercent,
+    unattributedPercent: attribution.unattributedPercent,
+    samples: samples.length,
+    threads,
+    activity,
+    cloudTasksInWindow: countCloudTasksBetween(windowStartsAt, now)
+  };
+}
+
+interface EfficiencyAccumulator {
+  estimatedUsagePercent: number;
+  activeMinutes: number;
+  tokens: number;
+  estimatedApiCostUsd: number;
+  spans: number;
+}
+
+/** Per-model quota efficiency across the given banks. Exported for tests. */
+export function estimateModelEfficiencyForHistory(
+  history: RateLimitWindow[],
+  durationMins: number,
+  events: TokenEventRow[],
+  runs: PromptRunRow[],
+  now = Math.floor(Date.now() / 1000)
+): ModelEfficiency[] {
+  const totals = new Map<string, EfficiencyAccumulator>();
+  const sortedEvents = [...events].sort((a, b) => a.observedAt - b.observedAt);
+  const costPerToken = fallbackCostPerToken(sortedEvents);
+
+  for (const bank of bankRanges(history, durationMins, now)) {
+    const bankEvents = sliceEvents(sortedEvents, bank.start, bank.end);
+    const quotaEvents = toQuotaEvents(
+      bankEvents,
+      (event) => (event.model === 'unknown' || event.model === AUTO_REVIEW_MODEL ? null : event.model),
+      costPerToken
+    );
+    if (quotaEvents.length === 0) continue;
+    const attribution = attributeQuotaUsage(bank.samples, quotaEvents);
+    for (const [model, row] of attribution.byKey) {
+      if (row.percent <= 0) continue;
+      const accumulator = totals.get(model) ?? {
+        estimatedUsagePercent: 0,
+        activeMinutes: 0,
+        tokens: 0,
+        estimatedApiCostUsd: 0,
+        spans: 0
+      };
+      accumulator.estimatedUsagePercent += row.percent;
+      accumulator.spans += row.spans;
+      for (const event of bankEvents) {
+        if (event.model !== model) continue;
+        accumulator.tokens += event.totalTokens;
+        accumulator.estimatedApiCostUsd += event.estimatedApiCostUsd ?? 0;
+      }
+      for (const run of runs) {
+        if (run.primaryModel !== model) continue;
+        const start = Math.max(run.startedAt, bank.start);
+        const end = Math.min(run.completedAt, bank.end);
+        if (end > start) accumulator.activeMinutes += (end - start) / 60;
+      }
+      totals.set(model, accumulator);
+    }
+  }
+
+  return [...totals.entries()]
+    .map(([model, row]) => ({
+      model,
+      ...row,
+      minutesPerPercent: row.estimatedUsagePercent > 0 && row.activeMinutes > 0
+        ? row.activeMinutes / row.estimatedUsagePercent
+        : null,
+      tokensPerPercent: row.estimatedUsagePercent > 0 ? row.tokens / row.estimatedUsagePercent : null,
+      costPerPercent: row.estimatedUsagePercent > 0 && row.estimatedApiCostUsd > 0
+        ? row.estimatedApiCostUsd / row.estimatedUsagePercent
+        : null
+    }))
+    .sort((a, b) => b.estimatedUsagePercent - a.estimatedUsagePercent);
+}
+
+const AUTO_REVIEW_MODEL = 'codex-auto-review';
+
+/** Auto-review runs against the parent chat's model, so its tokens count toward that model. */
+function foldReviewEvents(events: TokenEventRow[]): TokenEventRow[] {
+  const primaryModels = getThreadTitleMap();
+  return events.map((event) => {
+    if (event.partKind !== 'reviewer' && event.model !== AUTO_REVIEW_MODEL) return event;
+    const parentModel = primaryModels.get(event.threadId)?.model;
+    return parentModel && parentModel !== 'unknown' ? { ...event, model: parentModel } : event;
+  });
+}
+
+export function calculateModelEfficiency(): ModelEfficiency[] {
+  const now = Math.floor(Date.now() / 1000);
+  const since = now - MODEL_EFFICIENCY_LOOKBACK_DAYS * 86400;
+  const events = foldReviewEvents(getTokenEventsBetween(since, now));
+  const runs = getPromptRunsBetween(since, now);
+  const fiveHour = estimateModelEfficiencyForHistory(
+    getRateLimitHistory(300, undefined, MODEL_EFFICIENCY_LOOKBACK_DAYS),
+    300,
+    events,
+    runs,
+    now
+  );
+  if (fiveHour.length > 0) return fiveHour;
+  return estimateModelEfficiencyForHistory(
+    getRateLimitHistory(10_080, undefined, MODEL_EFFICIENCY_LOOKBACK_DAYS * 2),
+    10_080,
+    foldReviewEvents(getTokenEventsBetween(now - MODEL_EFFICIENCY_LOOKBACK_DAYS * 2 * 86400, now)),
+    getPromptRunsBetween(now - MODEL_EFFICIENCY_LOOKBACK_DAYS * 2 * 86400, now),
+    now
   );
 }

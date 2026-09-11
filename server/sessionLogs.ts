@@ -9,6 +9,7 @@ import {
   replaceThreadData,
   type StoredThreadEvent
 } from './db.js';
+import { classifyThreadSource } from './codex/localThreadMetadata.js';
 import { cleanUserMessage, extractRawUserMessage } from './messageText.js';
 import { estimateUsageCost, findPricing } from './pricing.js';
 import type {
@@ -17,8 +18,11 @@ import type {
   RateLimitWindow,
   SessionPartKind,
   ThreadPartSummary,
+  ThreadSource,
   TokenUsage
 } from './types.js';
+
+const AUTO_REVIEW_MODEL = 'codex-auto-review';
 
 type JsonRecord = Record<string, unknown>;
 
@@ -160,6 +164,19 @@ function detectPartKind(record: JsonRecord): SessionPartKind | null {
   return 'main';
 }
 
+function detectSource(record: JsonRecord): { source: ThreadSource; sourceLabel: string | null } | null {
+  if (String(record.type).toLowerCase() !== 'session_meta') return null;
+  const payload = isRecord(record.payload) ? record.payload : null;
+  if (!payload) return null;
+  const source = typeof payload.source === 'string'
+    ? payload.source
+    : payload.source === undefined || payload.source === null
+      ? null
+      : JSON.stringify(payload.source);
+  const threadSource = typeof payload.thread_source === 'string' ? payload.thread_source : null;
+  return classifyThreadSource(source, threadSource);
+}
+
 function addUsage(target: TokenUsage, usage: TokenUsage): void {
   target.inputTokens += usage.inputTokens;
   target.cachedInputTokens += usage.cachedInputTokens;
@@ -260,6 +277,8 @@ export async function parseSessionFile(sourceFile: string): Promise<ParsedSessio
   let projectPath: string | null = null;
   let currentModel = 'unknown';
   let partKind: SessionPartKind = 'main';
+  let source: ThreadSource = 'unknown';
+  let sourceLabel: string | null = null;
   let startedAt: number | null = null;
   let updatedAt: number | null = null;
   let lineNumber = 0;
@@ -339,6 +358,11 @@ export async function parseSessionFile(sourceFile: string): Promise<ParsedSessio
     threadId ??= extractThreadId(record);
     projectPath ??= extractProjectPath(record);
     partKind = detectPartKind(record) ?? partKind;
+    const detectedSource = detectSource(record);
+    if (detectedSource) {
+      source = detectedSource.source;
+      sourceLabel = detectedSource.sourceLabel;
+    }
 
     const payload = isRecord(record.payload) ? record.payload : null;
     const type = eventType(record);
@@ -392,7 +416,7 @@ export async function parseSessionFile(sourceFile: string): Promise<ParsedSessio
     const model = extractModel(record);
     if (model) {
       currentModel = model;
-      if (model.toLowerCase() === 'codex-auto-review') partKind = 'reviewer';
+      if (model.toLowerCase() === AUTO_REVIEW_MODEL) partKind = 'reviewer';
     }
 
     const usage = findIncrementalUsage(record);
@@ -456,7 +480,10 @@ export async function parseSessionFile(sourceFile: string): Promise<ParsedSessio
 
   const primaryModel =
     [...modelTokens.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? currentModel;
-  const unknownModels = [...models].filter((model) => findPricing(model) === null);
+  // Auto-review has no public API price, so it never makes a chat's estimate "partial".
+  const unknownModels = [...models].filter(
+    (model) => model.toLowerCase() !== AUTO_REVIEW_MODEL && findPricing(model) === null
+  );
   const pricingStatus: PricingStatus =
     pricedEvents === 0 ? 'unknown' : unknownModels.length > 0 ? 'partial' : 'exact-model-match';
 
@@ -474,7 +501,9 @@ export async function parseSessionFile(sourceFile: string): Promise<ParsedSessio
       pricingStatus,
       sourceFile,
       partKind,
-      userMessageCount: partKind === 'main' ? userMessageCount : 0
+      userMessageCount: partKind === 'main' ? userMessageCount : 0,
+      source,
+      sourceLabel
     },
     events,
     prompts
@@ -489,7 +518,7 @@ export async function scanCodexSessions(): Promise<{
   const codexHome = path.resolve(process.env.CODEX_HOME || path.join(os.homedir(), '.codex'));
   const roots = [path.join(codexHome, 'sessions'), path.join(codexHome, 'archived_sessions')];
   const files = (await Promise.all(roots.map(listJsonlFiles))).flat();
-  const parserVersion = '4';
+  const parserVersion = '6';
   const markerPath = path.resolve(process.cwd(), 'data', '.session-parser-version');
   const installedVersion = fs.existsSync(markerPath)
     ? (await fs.promises.readFile(markerPath, 'utf8')).trim()

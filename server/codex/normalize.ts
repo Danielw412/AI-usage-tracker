@@ -151,3 +151,60 @@ export function normalizeAccount(payload: unknown): {
     planType: typeof account.planType === 'string' ? account.planType : null
   };
 }
+
+function integerValue(value: unknown): number | null {
+  const parsed = numberValue(value);
+  return parsed === null ? null : Math.round(parsed);
+}
+
+/** Plan and reset-credit details that ride along with `account/rateLimits/read`. */
+export function normalizeRateLimitExtras(payload: unknown): {
+  planType: string | null;
+  resetCreditsAvailable: number | null;
+} {
+  if (!isRecord(payload)) return { planType: null, resetCreditsAvailable: null };
+  const snapshot = isRecord(payload.rateLimits) ? payload.rateLimits : payload;
+  const planType =
+    (typeof snapshot.planType === 'string' && snapshot.planType) ||
+    (typeof snapshot.plan_type === 'string' && snapshot.plan_type) ||
+    null;
+  const credits = isRecord(payload.rateLimitResetCredits)
+    ? payload.rateLimitResetCredits
+    : isRecord(payload.rate_limit_reset_credits)
+      ? payload.rate_limit_reset_credits
+      : null;
+  const resetCreditsAvailable = credits
+    ? integerValue(credits.availableCount ?? credits.available_count)
+    : null;
+  return { planType, resetCreditsAvailable };
+}
+
+export interface UsageSummary {
+  lifetimeTokens: number | null;
+  peakDailyTokens: number | null;
+  longestRunningTurnSec: number | null;
+  currentStreakDays: number | null;
+  longestStreakDays: number | null;
+}
+
+/** Account-wide lifetime statistics from `account/usage/read`. */
+export function normalizeUsageSummary(payload: unknown): UsageSummary {
+  const empty: UsageSummary = {
+    lifetimeTokens: null,
+    peakDailyTokens: null,
+    longestRunningTurnSec: null,
+    currentStreakDays: null,
+    longestStreakDays: null
+  };
+  if (!isRecord(payload)) return empty;
+  const summary = isRecord(payload.summary) ? payload.summary : payload;
+  return {
+    lifetimeTokens: integerValue(summary.lifetimeTokens ?? summary.lifetime_tokens),
+    peakDailyTokens: integerValue(summary.peakDailyTokens ?? summary.peak_daily_tokens),
+    longestRunningTurnSec: integerValue(
+      summary.longestRunningTurnSec ?? summary.longest_running_turn_sec
+    ),
+    currentStreakDays: integerValue(summary.currentStreakDays ?? summary.current_streak_days),
+    longestStreakDays: integerValue(summary.longestStreakDays ?? summary.longest_streak_days)
+  };
+}

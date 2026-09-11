@@ -6,22 +6,16 @@ The dashboard runs entirely on your computer. It starts `codex app-server`, read
 
 ## What it shows
 
-- Current 5-hour usage, reset time, recent burn rate, and projected usage at reset.
-- Current 7-day usage, reset time, recent burn rate, and projected usage at reset.
-- Over-limit reporting that preserves percentages above 100% instead of clipping them.
-- Reset-aware projections that restart the trend after an unexpected downward quota change.
-- Graceful handling when Codex does not report a 5-hour window. The card shows **Not reported** while older history remains stored.
-- Graphs for the active 5-hour and 7-day quota windows.
-- Daily token activity for the last seven days.
-- Per-thread model, total tokens, cached/uncached input, output, reasoning output, and estimated API-equivalent cost.
-- Estimated 5-hour and 7-day quota consumed by each thread, based on timestamp-bracketed task runs.
-- User-facing Codex chat names read directly from the local desktop state, with App Server metadata and the first cleaned prompt used only as fallbacks.
-- Search, over-limit filtering, sorting, persistent section navigation, and a responsive mobile worklist.
-- Expandable thread details with prompt-level token use, timing, first-token latency, cache use, model, and estimated cost.
-- Separate model graphs for total tokens and API-equivalent cost.
-- Total indexed tokens and total API-equivalent cost.
-- Estimated minutes per 1% of quota for each model.
-- Accuracy notes that distinguish direct Codex data from calculated estimates.
+- Current 5-hour and 7-day usage, reset countdowns, burn rate, and a projection that stops at the limit.
+- A segmented meter on each window showing which chats consumed it, what came from cloud tasks or other devices, and what happened before tracking began.
+- A usage chart with the projected path to reset and lanes showing when each chat was running.
+- Account statistics reported by Codex: lifetime tokens, busiest day, streak, longest turn, and available rate-limit reset credits.
+- Every local chat with its real Codex-generated name, source (desktop, CLI, scripted run, review), project, branch, model and reasoning effort, tokens, API-equivalent price, and its share of each window.
+- Expandable chat details with token mix, review overhead, timing per prompt, and attribution coverage.
+- Daily tokens for the last 14 days and a weekday-by-hour activity heatmap.
+- A model ledger with tokens, API-equivalent price, five-hour windows consumed, tokens per 1% of quota, and active minutes per 1%.
+- Recent Codex Cloud tasks from the CLI, next to the unattributed usage they most likely explain.
+- The browser tab title shows both percentages so the numbers are visible from any window.
 
 ## Requirements
 
@@ -95,6 +89,8 @@ Copy `.env.example` to `.env`. Supported values:
 | `RATE_LIMIT_POLL_MS` | `60000` | Account quota polling interval. |
 | `ACCOUNT_USAGE_POLL_MS` | `900000` | Account daily-token summary polling interval. |
 | `THREAD_METADATA_POLL_MS` | `900000` | App Server thread-name and preview refresh interval. |
+| `CLOUD_TASK_POLL_MS` | `600000` | How often `codex cloud list --json` is polled for cloud tasks. |
+| `CLOUD_TASKS` | `true` | Set to `false` to skip cloud task polling. |
 | `SESSION_SCAN_MS` | `120000` | Local session-log scan interval. |
 | `DEMO_MODE` | `false` | Use generated sample data. |
 | `PORT` | `8787` | Backend and production-web port. |
@@ -115,20 +111,25 @@ codex-usage-dashboard/
 ├─ server/
 │  ├─ codex/
 │  │  ├─ AppServerClient.ts     JSON-RPC client for codex app-server
+│  │  ├─ localThreadMetadata.ts Chat names, sources, and projects from the desktop state database
 │  │  └─ normalize.ts           Compatibility layer for App Server payloads
-│  ├─ analytics.ts              Trend, projection, and efficiency calculations
+│  ├─ analytics.ts              Projections, bank clustering, window breakdowns, model efficiency
+│  ├─ cloudTasks.ts             Codex Cloud task listing through the CLI
 │  ├─ db.ts                     Local SQLite schema and queries
 │  ├─ demo.ts                   Generated UI test data
 │  ├─ index.ts                  Express API, polling, and static hosting
+│  ├─ messageText.ts            Prompt and title cleaning
 │  ├─ pricing.ts                API-equivalent cost calculation
 │  ├─ sessionLogs.ts            Best-effort local Codex JSONL parser
-│  └─ types.ts                  Backend data types
+│  ├─ threadUsage.ts            Quota attribution engine
+│  └─ types.ts                  Shared data types
 ├─ src/
-│  ├─ App.tsx                   Dashboard components and charts
-│  ├─ api.ts                    Frontend API calls
-│  ├─ styles.css                Core design system and responsive layout
-│  ├─ analytics.css             Expandable thread and model-chart styles
-│  └─ types.ts                  Frontend data types
+│  ├─ App.tsx                   Page layout and data loading
+│  ├─ components/               Window cards, usage chart, chats table, model ledger, cloud tasks
+│  ├─ format.ts                 Number, time, and label formatting
+│  ├─ palette.ts                Validated categorical colors for chats
+│  ├─ styles.css                Design tokens, layout, and components
+│  └─ types.ts                  Mirror of the server types
 ├─ .env.example
 ├─ package.json
 └─ vite.config.ts
@@ -183,29 +184,35 @@ The session scanner reads JSONL files under:
 ~/.codex/archived_sessions
 ```
 
-It looks for incremental token-usage events, model metadata, timestamps, working directory, thread ID, user prompts, task start/completion events, and embedded rate-limit snapshots. This parser is intentionally isolated in `server/sessionLogs.ts` because local log formats can change.
+It looks for incremental token-usage events, model metadata, timestamps, working directory, thread ID, source, user prompts, task start/completion events, and the rate-limit snapshot embedded in every token event. This parser is intentionally isolated in `server/sessionLogs.ts` because local log formats can change.
 
-The backend also calls App Server `thread/list` for persisted thread metadata. When Codex reports a user-facing thread name, the dashboard uses it. If no name is available, it uses the App Server preview and then the first cleaned prompt as fallbacks.
+Chat names come from three places, in order of preference:
 
-Each normal thread is grouped with its reviewer/guardian session parts. The main Sol/Terra model remains the displayed primary model, while auto-review tokens are shown as review overhead.
+1. The `name` column of the Codex desktop state database (`state_5.sqlite`). This is the generated chat name shown in the Codex app.
+2. The `name` field returned by App Server `thread/list`.
+3. A label built from the thread's source, for example `school-dashboard run`, with the cleaned first prompt shown underneath.
 
-The parser can recover prior usage only when the corresponding local session files still exist and contain usable records. It does not invent missing tokens. A thread whose model cannot be matched to `config/pricing.json` remains visible, but its price is excluded from the total.
+The raw first prompt is never used as a chat name. The desktop database also provides the thread source, model, reasoning effort, git branch, and project, which appear in the chat list.
+
+Each chat is grouped with its auto-review (guardian) sessions. Review tokens are shown as overhead and do not affect whether a chat's price is marked as complete, because auto-review has no public API price.
 
 ### Per-thread usage and prompt metrics
 
-Codex does not directly provide an exact “this thread used X% of the quota” value. The dashboard estimates thread-level 5-hour and 7-day usage from completed task timestamps. For each run, it takes the quota sample at or before the start and the sample at or after completion, then subtracts the two percentages. Separate runs of a long-lived thread are calculated independently, so quota changes during idle gaps are not attributed to that thread. When coarse polling brackets multiple sequential tasks, the observed change is divided by active run time to avoid double-counting. A downward quota change splits attribution into separate reset segments; estimates remain blank unless every completed run is fully bracketed by reliable samples.
+Codex only reports account-wide percentages. The dashboard attributes them to chats with an event-weighted model in `server/threadUsage.ts`:
 
-Expanded thread rows show prompt segments recovered from local logs. Timing is labeled by quality:
+1. Every quota sample for one reset bank is placed on a timeline. Samples come from App Server polling and from the snapshots embedded in session logs; reset times that differ by a few seconds are clustered into the same bank.
+2. Each time the reported percentage climbs to a new high, the increase is split between the token events logged since the previous high, in proportion to their API-equivalent cost (tokens times an average rate for unpriced models).
+3. Two chats running at the same time therefore share an increase by how much work each did, not by wall-clock time. The share earned while other chats were running is reported separately.
+4. An increase with no local token events behind it is counted as unattributed usage. That is where Codex Cloud tasks, the ChatGPT web app, and other machines show up.
+5. Small drops between sources are treated as noise; a fall larger than 2.5 points, or a new reset time, starts a fresh segment.
 
-- **Exact** when Codex reports a task duration or first-token latency.
-- **Derived** when duration is calculated from logged prompt, task, and completion timestamps.
-- **Unavailable** when the required events were not persisted.
+Each chat reports its share of the most recent window it was active in, plus a coverage figure: the fraction of its weighted tokens that were bracketed by a quota rise. A chat whose tokens have not yet moved the reported percentage shows as pending.
 
-Steering messages sent while a task is already running are treated as separate prompts when the rollout log preserves them. Token events are assigned to the active prompt segment on a best-effort basis.
+Expanded chat rows show prompt segments recovered from local logs. Timing is exact when Codex reports a completed turn and derived from timestamps otherwise; derived durations are marked.
 
 ### Model token and cost graphs
 
-The model token graph sums input and output token events by the model recorded for each request. The cost graph sums the API-equivalent estimate for those same events. Auto-review remains a separate model category in these graphs so its overhead is visible, even though it is grouped under the parent thread in the thread table.
+The model ledger sums tokens and API-equivalent price by the model recorded for each request. Auto-review appears as its own token row, but for quota efficiency its tokens are folded into the parent chat's model, since the review ran on that chat's behalf.
 
 ### API-equivalent cost
 
@@ -223,22 +230,24 @@ For supported long-context models, a request whose input exceeds the configured 
 
 ### Minutes per 1% by model
 
-Codex does not directly attribute account quota percentage to individual models. The dashboard estimates this metric from the 30 most recently completed chats by correlating:
+The same attribution runs with the model as the key across the five-hour windows of the last 15 days. For each model the ledger reports:
 
-1. each completed task's start and completion timestamps,
-2. the quota values immediately bracketing that task, and
-3. the task's primary model and actual active duration.
+- windows used: attributed percentage divided by 100,
+- tokens per 1%: how many tokens the model processed for each point of quota,
+- minutes per 1%: active task minutes for each point of quota.
 
-The chart reports actual task minutes per estimated 1% of quota; a higher value means the model sustained more active work per percentage point. When coarse polling brackets multiple sequential tasks, the quota change is divided by their active durations so it is not counted twice. Treat this graph as comparative rather than exact.
+Treat these as comparative rather than exact.
+
+### Cloud tasks
+
+`codex cloud list --json` is polled on a slow interval. Tasks are stored locally with their status, environment, and diff summary. The dashboard cannot see tokens for cloud tasks, so their cost shows up in the unattributed share of each window. The cloud section shows both together.
 
 ## Accuracy limits
 
 - Historical quota points can be recovered from older rollout logs when those logs contain rate-limit snapshots. Gaps that were never logged cannot be reconstructed.
-- `account/usage/read` may provide older daily token buckets, depending on the account and authentication mode.
-- A separate dashboard does not automatically receive every live per-thread event from another Codex client, so local session logs are used for thread and prompt accounting.
-- Thread-level quota percentages are timestamp-based estimates, not values directly reported by Codex.
-- User-facing thread names depend on App Server metadata. A prompt-derived fallback is shown when no persisted name is returned.
-- Token totals do not convert directly into ChatGPT quota percentage. Model, caching, reasoning, tools, images, and Codex service accounting can affect quota use.
+- `account/usage/read` may provide older daily token buckets, depending on the account and authentication mode. Its per-thread estimate is only available on usage-based plans and is not used.
+- Chat shares are estimates. Reported percentages are integers, so small chats can stay pending until the limit moves.
+- Unattributed usage includes anything without a local log: cloud tasks, other devices, and sessions whose rollout files were removed.
 - API-equivalent prices can become outdated. Review `config/pricing.json` after model or pricing changes.
 
 ## Updating Codex safely

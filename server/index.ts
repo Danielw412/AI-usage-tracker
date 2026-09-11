@@ -3,14 +3,19 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import express from 'express';
 import { AppServerClient } from './codex/AppServerClient.js';
-import { readLocalThreadMetadata } from './codex/localThreadMetadata.js';
+import { classifyThreadSource, readLocalThreadMetadata } from './codex/localThreadMetadata.js';
 import {
   normalizeAccount,
   normalizeDailyUsage,
-  normalizeRateLimits
+  normalizeRateLimitExtras,
+  normalizeRateLimits,
+  normalizeUsageSummary,
+  type UsageSummary
 } from './codex/normalize.js';
 import {
   getAccountDailyUsage,
+  getCloudTasks,
+  getHourlyActivity,
   getLocalDailyUsage,
   getModelUsageSummaries,
   getRateLimitHistory,
@@ -18,14 +23,18 @@ import {
   getTokenTotals,
   insertRateLimitSnapshot,
   upsertAccountDailyUsage,
-  upsertThreadMetadata
+  upsertCloudTasks,
+  upsertThreadMetadata,
+  type ThreadMetadataInput
 } from './db.js';
 import {
   buildChartPoints,
   calculateModelEfficiency,
   calculateProjection,
-  calculateThreadUsageEstimates
+  calculateThreadUsageEstimates,
+  calculateWindowBreakdown
 } from './analytics.js';
+import { listCloudTasks } from './cloudTasks.js';
 import { demoOverview } from './demo.js';
 import { loadPricingConfig } from './pricing.js';
 import { scanCodexSessions } from './sessionLogs.js';
@@ -40,6 +49,8 @@ const rateLimitPollMs = Number(process.env.RATE_LIMIT_POLL_MS || 60_000);
 const accountUsagePollMs = Number(process.env.ACCOUNT_USAGE_POLL_MS || 900_000);
 const sessionScanMs = Number(process.env.SESSION_SCAN_MS || 120_000);
 const threadMetadataPollMs = Number(process.env.THREAD_METADATA_POLL_MS || 900_000);
+const cloudTaskPollMs = Number(process.env.CLOUD_TASK_POLL_MS || 600_000);
+const cloudTasksEnabled = process.env.CLOUD_TASKS !== 'false';
 
 const codex = new AppServerClient();
 let limits: RateLimitWindow[] = [];
@@ -47,11 +58,27 @@ let accountState: { authType: string | null; planType: string | null } = {
   authType: null,
   planType: null
 };
+let accountExtras: { planType: string | null; resetCreditsAvailable: number | null } = {
+  planType: null,
+  resetCreditsAvailable: null
+};
+let usageSummary: UsageSummary = {
+  lifetimeTokens: null,
+  peakDailyTokens: null,
+  longestRunningTurnSec: null,
+  currentStreakDays: null,
+  longestStreakDays: null
+};
 let connectionError: string | null = null;
 let refreshInProgress: Promise<void> | null = null;
 let sessionRefreshInProgress: Promise<void> | null = null;
+let cloudRefreshInProgress: Promise<void> | null = null;
 let lastAccountUsageRefresh = 0;
 let lastThreadMetadataRefresh = 0;
+let cloudTasksStatus: DashboardOverview['cloudTasks']['status'] = cloudTasksEnabled
+  ? 'unavailable'
+  : 'disabled';
+let cloudTasksCheckedAt: number | null = null;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -94,15 +121,24 @@ function pickWindow(duration: number): RateLimitWindow | null {
   );
 }
 
+function localMetadataInputs(): ThreadMetadataInput[] {
+  return readLocalThreadMetadata().map((item) => ({
+    threadId: item.threadId,
+    displayName: item.displayName,
+    preview: item.preview,
+    updatedAt: item.updatedAt,
+    source: item.source,
+    sourceLabel: item.sourceLabel,
+    model: item.model,
+    reasoningEffort: item.reasoningEffort,
+    gitBranch: item.gitBranch,
+    projectName: item.projectName,
+    archived: item.archived
+  }));
+}
+
 async function refreshThreadMetadata(): Promise<void> {
-  const localMetadata = readLocalThreadMetadata();
-  if (localMetadata.length > 0) upsertThreadMetadata(localMetadata);
-  const collected: Array<{
-    threadId: string;
-    displayName: string | null;
-    preview: string | null;
-    updatedAt: number;
-  }> = [];
+  const collected: ThreadMetadataInput[] = [];
 
   for (const archived of [false, true]) {
     let cursor: string | null = null;
@@ -120,11 +156,23 @@ async function refreshThreadMetadata(): Promise<void> {
         if (!isRecord(value)) continue;
         const threadId = firstText(value, ['id', 'threadId', 'thread_id']);
         if (!threadId) continue;
+        const classified = classifyThreadSource(
+          firstText(value, ['source']),
+          firstText(value, ['threadSource', 'thread_source'])
+        );
+        const gitInfo = isRecord(value.gitInfo) ? value.gitInfo : null;
         collected.push({
           threadId,
-          displayName: firstText(value, ['name', 'title', 'threadName', 'displayName']),
+          // Only generated names count as display names; previews are raw prompts.
+          displayName: firstText(value, ['name', 'threadName', 'displayName']),
           preview: firstText(value, ['preview', 'promptPreview']),
-          updatedAt: parseTime(value.updatedAt ?? value.updated_at ?? value.recencyAt ?? value.createdAt)
+          updatedAt: parseTime(value.updatedAt ?? value.updated_at ?? value.recencyAt ?? value.createdAt),
+          source: classified.source,
+          sourceLabel: classified.sourceLabel,
+          model: firstText(value, ['model']),
+          reasoningEffort: firstText(value, ['reasoningEffort', 'reasoning_effort']),
+          gitBranch: gitInfo ? firstText(gitInfo, ['branch']) : null,
+          archived
         });
       }
       cursor = typeof result.nextCursor === 'string' && result.nextCursor ? result.nextCursor : null;
@@ -133,9 +181,8 @@ async function refreshThreadMetadata(): Promise<void> {
   }
 
   if (collected.length > 0) upsertThreadMetadata(collected);
-  // The desktop state database contains the user-facing chat name. Apply it
-  // last so an App Server prompt preview can never replace the real name.
-  if (localMetadata.length > 0) upsertThreadMetadata(localMetadata);
+  const local = localMetadataInputs();
+  if (local.length > 0) upsertThreadMetadata(local);
   lastThreadMetadataRefresh = Date.now();
 }
 
@@ -155,6 +202,7 @@ async function refreshCodexData(forceAccountUsage = false): Promise<void> {
         limits = normalized;
         for (const limit of normalized) insertRateLimitSnapshot(limit);
       }
+      accountExtras = normalizeRateLimitExtras(rateResult);
       connectionError = null;
 
       const now = Date.now();
@@ -163,6 +211,7 @@ async function refreshCodexData(forceAccountUsage = false): Promise<void> {
           const usageResult = await codex.request('account/usage/read');
           const daily = normalizeDailyUsage(usageResult);
           if (daily.length > 0) upsertAccountDailyUsage(daily);
+          usageSummary = normalizeUsageSummary(usageResult);
           lastAccountUsageRefresh = now;
         } catch (error) {
           console.warn('Account usage summary unavailable:', (error as Error).message);
@@ -194,8 +243,8 @@ async function refreshSessions(): Promise<void> {
 
   sessionRefreshInProgress = (async () => {
     const result = await scanCodexSessions();
-    const localMetadata = readLocalThreadMetadata();
-    if (localMetadata.length > 0) upsertThreadMetadata(localMetadata);
+    const local = localMetadataInputs();
+    if (local.length > 0) upsertThreadMetadata(local);
     if (process.env.DEBUG_CODEX_DASHBOARD === 'true') {
       console.log(`Session scan: ${result.scanned} found, ${result.updated} updated, ${result.errors} errors`);
     }
@@ -204,6 +253,30 @@ async function refreshSessions(): Promise<void> {
   });
 
   return sessionRefreshInProgress;
+}
+
+async function refreshCloudTasks(): Promise<void> {
+  if (demoMode || !cloudTasksEnabled) return;
+  if (cloudRefreshInProgress) return cloudRefreshInProgress;
+
+  cloudRefreshInProgress = (async () => {
+    try {
+      const tasks = await listCloudTasks(20);
+      if (tasks.length > 0) upsertCloudTasks(tasks);
+      cloudTasksStatus = 'available';
+    } catch (error) {
+      cloudTasksStatus = 'unavailable';
+      if (process.env.DEBUG_CODEX_DASHBOARD === 'true') {
+        console.warn('Codex Cloud task list unavailable:', (error as Error).message);
+      }
+    } finally {
+      cloudTasksCheckedAt = Math.floor(Date.now() / 1000);
+    }
+  })().finally(() => {
+    cloudRefreshInProgress = null;
+  });
+
+  return cloudRefreshInProgress;
 }
 
 function buildOverview(): DashboardOverview {
@@ -220,48 +293,19 @@ function buildOverview(): DashboardOverview {
   const fiveProjection = calculateProjection(fiveHour, fiveHistory);
   const sevenProjection = calculateProjection(sevenDay, sevenHistory);
   const usageEstimates = calculateThreadUsageEstimates(fiveHour, sevenDay);
-  const threads = getThreadSummaries(100).map((thread) => {
-    const usage = usageEstimates.get(thread.threadId);
-    return {
-      ...thread,
-      estimatedFiveHourUsagePercent: usage?.fiveHourPercent ?? null,
-      estimatedSevenDayUsagePercent: usage?.sevenDayPercent ?? null,
-      usageSampleIntervals: usage?.sampleIntervals ?? 0,
-      usageResetSegments: usage?.resetSegments ?? 0
-    };
-  });
+  const threads = getThreadSummaries(120).map((thread) => ({
+    ...thread,
+    usage: usageEstimates.get(thread.threadId) ?? { fiveHour: null, sevenDay: null }
+  }));
   const totals = getTokenTotals();
   const notices: string[] = [];
 
-  if (!fiveHour) {
-    notices.push(
-      'Codex is not currently reporting a 5-hour window. The dashboard keeps prior 5-hour history and will resume automatically if the window returns.'
-    );
-  }
-  if (!sevenDay) notices.push('Codex is not currently reporting a 7-day rate-limit window.');
   if (threads.length === 0) {
     notices.push(
       'No local session token events were found. Check CODEX_HOME or create a new Codex thread, then refresh.'
     );
   }
-  if (totals.unknownPriceThreads > 0) {
-    notices.push(
-      `${totals.unknownPriceThreads} thread(s) include a model that is not in config/pricing.json, so part of their cost may be unavailable.`
-    );
-  }
   if (connectionError) notices.push(`Codex account connection error: ${connectionError}`);
-  notices.push(
-    'Thread quota usage is the timestamp-bracketed change across completed task runs. It stays blank unless every run in the selected quota bank has a sample at or before its start and at or after its completion.'
-  );
-  notices.push(
-    'Model efficiency uses the 30 most recently completed chats and reports actual task minutes per estimated 1% of quota.'
-  );
-  notices.push(
-    'Prompt duration is exact when Codex reports a completed turn. Steering messages inside one turn use the time until the next prompt or turn completion.'
-  );
-  notices.push(
-    'API-equivalent cost is an estimate based on public API token prices; it is not your ChatGPT subscription charge.'
-  );
 
   return {
     generatedAt: Math.floor(Date.now() / 1000),
@@ -269,6 +313,11 @@ function buildOverview(): DashboardOverview {
       codexConnected: codex.connected && !connectionError,
       ...accountState,
       error: connectionError
+    },
+    account: {
+      planType: accountExtras.planType ?? accountState.planType,
+      resetCreditsAvailable: accountExtras.resetCreditsAvailable,
+      ...usageSummary
     },
     limits: {
       fiveHour,
@@ -288,12 +337,22 @@ function buildOverview(): DashboardOverview {
       fiveHour: buildChartPoints(fiveHour, fiveHistory, fiveProjection),
       sevenDay: buildChartPoints(sevenDay, sevenHistory, sevenProjection)
     },
-    accountDailyUsage: getAccountDailyUsage(7),
-    localDailyUsage: getLocalDailyUsage(7),
+    breakdown: {
+      fiveHour: calculateWindowBreakdown(fiveHour, getRateLimitHistory(300, undefined, 2)),
+      sevenDay: calculateWindowBreakdown(sevenDay, getRateLimitHistory(10_080, undefined, 9))
+    },
+    accountDailyUsage: getAccountDailyUsage(14),
+    localDailyUsage: getLocalDailyUsage(14),
+    hourlyActivity: getHourlyActivity(30),
     totals,
     threads,
     modelEfficiency: calculateModelEfficiency(),
     modelUsage: getModelUsageSummaries(),
+    cloudTasks: {
+      status: cloudTasksStatus,
+      checkedAt: cloudTasksCheckedAt,
+      tasks: getCloudTasks(20)
+    },
     notices
   };
 }
@@ -317,7 +376,7 @@ app.get('/api/pricing', (_request, response) => {
 
 app.post('/api/refresh', async (_request, response) => {
   lastThreadMetadataRefresh = 0;
-  await Promise.all([refreshCodexData(true), refreshSessions()]);
+  await Promise.all([refreshCodexData(true), refreshSessions(), refreshCloudTasks()]);
   response.json(buildOverview());
 });
 
@@ -337,8 +396,10 @@ app.listen(port, () => {
 
 void refreshCodexData(true);
 void refreshSessions();
+void refreshCloudTasks();
 setInterval(() => void refreshCodexData(false), rateLimitPollMs).unref();
 setInterval(() => void refreshSessions(), sessionScanMs).unref();
+setInterval(() => void refreshCloudTasks(), cloudTaskPollMs).unref();
 
 process.on('SIGINT', () => {
   codex.stop();

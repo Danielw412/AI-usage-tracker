@@ -59,7 +59,14 @@ const threads: ThreadSummary[] = [
     threadId: 'demo-1',
     title: 'Schedule import authentication',
     titleSource: 'codex-name',
+    preview: null,
     projectPath: 'C:\\Projects\\ScheduleShare',
+    projectName: 'ScheduleShare',
+    source: 'desktop',
+    sourceLabel: null,
+    reasoningEffort: 'high',
+    gitBranch: 'main',
+    archived: false,
     startedAt: now - 7200,
     updatedAt: now - 1800,
     primaryModel: 'gpt-5.6-sol',
@@ -70,22 +77,30 @@ const threads: ThreadSummary[] = [
     reasoningOutputTokens: 17_000,
     totalTokens: 1_502_000,
     estimatedApiCostUsd: 3.78,
-    pricingStatus: 'partial',
+    pricingStatus: 'exact-model-match',
     sourceFile: 'demo',
     userMessageCount: 2,
     reviewerTokens: 148_000,
+    subagentTokens: 0,
     partCount: 3,
     prompts: threadOnePrompts,
-    estimatedFiveHourUsagePercent: 9.8,
-    estimatedSevenDayUsagePercent: 3.4,
-    usageSampleIntervals: 12,
-    usageResetSegments: 1
+    usage: {
+      fiveHour: { percent: 9.8, coverage: 0.94, sharedPercent: 2.1, spans: 12, windowResetsAt: now + 5400, current: true },
+      sevenDay: { percent: 3.4, coverage: 0.94, sharedPercent: 0.6, spans: 4, windowResetsAt: now + 86400, current: true }
+    }
   },
   {
     threadId: 'demo-2',
     title: 'Cleaner mobile schedule grid',
     titleSource: 'codex-name',
+    preview: null,
     projectPath: 'C:\\Projects\\ScheduleShare',
+    projectName: 'ScheduleShare',
+    source: 'cli',
+    sourceLabel: null,
+    reasoningEffort: 'medium',
+    gitBranch: 'mobile-grid',
+    archived: false,
     startedAt: now - 86_400,
     updatedAt: now - 82_500,
     primaryModel: 'gpt-5.6-terra',
@@ -100,12 +115,13 @@ const threads: ThreadSummary[] = [
     sourceFile: 'demo',
     userMessageCount: 1,
     reviewerTokens: 0,
+    subagentTokens: 0,
     partCount: 1,
     prompts: threadTwoPrompts,
-    estimatedFiveHourUsagePercent: null,
-    estimatedSevenDayUsagePercent: 1.7,
-    usageSampleIntervals: 6,
-    usageResetSegments: 1
+    usage: {
+      fiveHour: { percent: 6.2, coverage: 1, sharedPercent: 0, spans: 6, windowResetsAt: now - 80_000, current: false },
+      sevenDay: { percent: 1.7, coverage: 1, sharedPercent: 0, spans: 6, windowResetsAt: now + 86400, current: true }
+    }
   }
 ];
 
@@ -118,6 +134,15 @@ export function demoOverview(): DashboardOverview {
   return {
     generatedAt: now,
     connection: { codexConnected: true, authType: 'chatgpt', planType: 'plus', error: null },
+    account: {
+      planType: 'plus',
+      resetCreditsAvailable: 2,
+      lifetimeTokens: 3_948_484_564,
+      peakDailyTokens: 278_178_665,
+      longestRunningTurnSec: 9_264,
+      currentStreakDays: 15,
+      longestStreakDays: 15
+    },
     limits: {
       fiveHour: {
         key: 'five-hour',
@@ -159,12 +184,51 @@ export function demoOverview(): DashboardOverview {
       }
     },
     histories: { fiveHour: fiveHistory, sevenDay: sevenHistory },
-    accountDailyUsage: Array.from({ length: 7 }, (_, index) => ({
-      date: new Date((now - (6 - index) * 86400) * 1000).toISOString().slice(0, 10),
-      tokens: [310000, 840000, 620000, 1250000, 470000, 910000, 720000][index],
+    breakdown: {
+      fiveHour: {
+        resetsAt: now + 5400,
+        windowStartsAt: now + 5400 - 5 * 3600,
+        observedDeltaPercent: 47,
+        attributedPercent: 41,
+        unattributedPercent: 6,
+        samples: 210,
+        threads: [
+          { threadId: 'demo-1', title: 'Schedule import authentication', model: 'gpt-5.6-sol', percent: 32.4, coverage: 0.94 },
+          { threadId: 'demo-2', title: 'Cleaner mobile schedule grid', model: 'gpt-5.6-terra', percent: 8.6, coverage: 1 }
+        ],
+        activity: [
+          { threadId: 'demo-1', startedAt: now - 7200, completedAt: now - 6040 },
+          { threadId: 'demo-1', startedAt: now - 5100, completedAt: now - 4460 },
+          { threadId: 'demo-2', startedAt: now - 6500, completedAt: now - 5900 }
+        ],
+        cloudTasksInWindow: 1
+      },
+      sevenDay: {
+        resetsAt: now + 86400,
+        windowStartsAt: now + 86400 - 7 * 86400,
+        observedDeltaPercent: 42,
+        attributedPercent: 39,
+        unattributedPercent: 3,
+        samples: 900,
+        threads: [
+          { threadId: 'demo-1', title: 'Schedule import authentication', model: 'gpt-5.6-sol', percent: 21.2, coverage: 0.94 },
+          { threadId: 'demo-2', title: 'Cleaner mobile schedule grid', model: 'gpt-5.6-terra', percent: 17.8, coverage: 1 }
+        ],
+        activity: [],
+        cloudTasksInWindow: 2
+      }
+    },
+    accountDailyUsage: Array.from({ length: 14 }, (_, index) => ({
+      date: new Date((now - (13 - index) * 86400) * 1000).toISOString().slice(0, 10),
+      tokens: [410000, 230000, 0, 1250000, 470000, 910000, 720000, 310000, 840000, 620000, 1250000, 470000, 910000, 720000][index],
       source: 'account' as const
     })),
     localDailyUsage: [],
+    hourlyActivity: Array.from({ length: 7 }, (_, day) =>
+      Array.from({ length: 24 }, (_, hour) =>
+        hour >= 9 && hour <= 23 && day !== 0 ? Math.round(120_000 * Math.abs(Math.sin(hour / 3 + day))) : 0
+      )
+    ),
     totals: {
       threads: 2,
       inputTokens: 2_220_000,
@@ -184,8 +248,10 @@ export function demoOverview(): DashboardOverview {
         activeMinutes: 76,
         minutesPerPercent: 3.92,
         tokens: 1_502_000,
+        tokensPerPercent: 77_400,
         estimatedApiCostUsd: 3.78,
-        sampleIntervals: 18
+        costPerPercent: 0.19,
+        spans: 18
       },
       {
         model: 'gpt-5.6-terra',
@@ -193,8 +259,10 @@ export function demoOverview(): DashboardOverview {
         activeMinutes: 51,
         minutesPerPercent: 5.93,
         tokens: 784_000,
+        tokensPerPercent: 91_200,
         estimatedApiCostUsd: 1.02,
-        sampleIntervals: 11
+        costPerPercent: 0.12,
+        spans: 11
       }
     ],
     modelUsage: [
@@ -232,6 +300,38 @@ export function demoOverview(): DashboardOverview {
         pricingStatus: 'exact-model-match'
       }
     ],
+    cloudTasks: {
+      status: 'available',
+      checkedAt: now - 120,
+      tasks: [
+        {
+          id: 'demo-cloud-1',
+          title: 'Add retry to the Canvas sync job',
+          status: 'ready',
+          updatedAt: now - 2400,
+          environmentLabel: 'school-dashboard',
+          url: null,
+          isReview: false,
+          filesChanged: 3,
+          linesAdded: 42,
+          linesRemoved: 11,
+          firstSeenAt: now - 3000
+        },
+        {
+          id: 'demo-cloud-2',
+          title: 'Review PR 128',
+          status: 'pending',
+          updatedAt: now - 30_000,
+          environmentLabel: 'scheduleshare',
+          url: null,
+          isReview: true,
+          filesChanged: null,
+          linesAdded: null,
+          linesRemoved: null,
+          firstSeenAt: now - 30_000
+        }
+      ]
+    },
     notices: ['Demo mode is enabled. Set DEMO_MODE=false to read your local Codex data.']
   };
 }
