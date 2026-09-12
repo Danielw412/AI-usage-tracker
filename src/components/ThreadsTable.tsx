@@ -11,14 +11,15 @@ import {
   relativeTime,
   usd
 } from '../format';
+import type { ProviderCopy } from '../providers';
+import type { PromptMetric, ThreadSummary, ThreadWindowUsage } from '../types';
 
 const PAGE_SIZE = 25;
-import type { PromptMetric, ThreadSummary, ThreadWindowUsage } from '../types';
 
 type ThreadFilter = 'all' | 'interactive' | 'scripts';
 type ThreadSort = 'recent' | 'five' | 'seven' | 'tokens' | 'cost';
 
-const INTERACTIVE_SOURCES = new Set(['desktop', 'cli', 'voice', 'unknown']);
+const INTERACTIVE_SOURCES = new Set(['desktop', 'cli', 'ide', 'voice', 'unknown']);
 
 function average(values: Array<number | null>): number | null {
   const valid = values.filter((value): value is number => value !== null);
@@ -76,17 +77,27 @@ function PromptRow({ prompt }: { prompt: PromptMetric }) {
   );
 }
 
-function ThreadDetail({ thread, now }: { thread: ThreadSummary; now: number }) {
-  const uncached = Math.max(0, thread.inputTokens - thread.cachedInputTokens);
-  const stackTotal = Math.max(1, thread.cachedInputTokens + uncached + thread.outputTokens);
+function ThreadDetail({ thread, copy, now }: { thread: ThreadSummary; copy: ProviderCopy; now: number }) {
+  const cacheWrites = Math.max(0, thread.cacheWriteInputTokens ?? 0);
+  const cacheWrites1h = Math.max(0, Math.min(thread.cacheWrite1hInputTokens ?? 0, cacheWrites));
+  const uncached = Math.max(0, thread.inputTokens - thread.cachedInputTokens - cacheWrites);
+  const stackTotal = Math.max(1, thread.cachedInputTokens + cacheWrites + uncached + thread.outputTokens);
   const totalPromptMs = thread.prompts.reduce((sum, prompt) => sum + (prompt.durationMs ?? 0), 0);
   const averageTtft = average(thread.prompts.map((prompt) => prompt.timeToFirstTokenMs));
   const tokensPerMinute = totalPromptMs > 0 ? thread.totalTokens / (totalPromptMs / 60_000) : null;
   const anyEstimated = thread.prompts.some((prompt) => prompt.timingEstimated && prompt.durationMs !== null);
   const stack = [
-    { label: 'Cached input', value: thread.cachedInputTokens, color: 'var(--ramp-1)' },
-    { label: 'Fresh input', value: uncached, color: 'var(--ramp-2)' },
-    { label: 'Output', value: thread.outputTokens, color: 'var(--ramp-3)' }
+    { label: 'Cached input', value: thread.cachedInputTokens, color: 'var(--ramp-1)', hint: null as string | null },
+    ...(cacheWrites > 0
+      ? [{
+          label: 'Cache writes',
+          value: cacheWrites,
+          color: 'var(--ramp-4)',
+          hint: cacheWrites1h > 0 ? `${compact(cacheWrites1h)} at the 1-hour rate` : null
+        }]
+      : []),
+    { label: 'Fresh input', value: uncached, color: 'var(--ramp-2)', hint: null },
+    { label: 'Output', value: thread.outputTokens, color: 'var(--ramp-3)', hint: null }
   ];
 
   const usageRows = [
@@ -110,7 +121,10 @@ function ThreadDetail({ thread, now }: { thread: ThreadSummary; now: number }) {
                 <i style={{ background: item.color }} aria-hidden="true" />
                 <span>{item.label}</span>
                 <b>{compact(item.value)}</b>
-                <small>{((item.value / stackTotal) * 100).toFixed(0)}%</small>
+                <small>
+                  {((item.value / stackTotal) * 100).toFixed(0)}%
+                  {item.hint ? <span className="detail-hint">, {item.hint}</span> : null}
+                </small>
               </li>
             ))}
             {thread.reviewerTokens > 0 ? (
@@ -161,6 +175,13 @@ function ThreadDetail({ thread, now }: { thread: ThreadSummary; now: number }) {
             <li><span>First token</span><b>{duration(averageTtft)}</b><small>average</small></li>
             <li><span>Tokens per minute</span><b>{tokensPerMinute === null ? '-' : compact(tokensPerMinute)}</b><small /></li>
             <li><span>Started</span><b>{dateTime(thread.startedAt)}</b><small>{thread.partCount} session {thread.partCount === 1 ? 'file' : 'files'}</small></li>
+            {thread.reportedCostUsd !== null ? (
+              <li>
+                <span>{copy.label} estimate</span>
+                <b>{usd(thread.reportedCostUsd)}</b>
+                <small>from the session log</small>
+              </li>
+            ) : null}
           </ul>
         </div>
       </div>
@@ -174,7 +195,7 @@ function ThreadDetail({ thread, now }: { thread: ThreadSummary; now: number }) {
             {thread.prompts.map((prompt) => <PromptRow key={prompt.promptId} prompt={prompt} />)}
           </ol>
         )}
-        {anyEstimated ? <p className="prompt-note">* duration derived from log timestamps rather than reported by Codex.</p> : null}
+        {anyEstimated ? <p className="prompt-note">{copy.derivedTimingNote}</p> : null}
       </div>
     </div>
   );
@@ -184,10 +205,11 @@ interface ThreadsTableProps {
   threads: ThreadSummary[];
   colors: Map<string, string>;
   selectedThreadId: string | null;
+  copy: ProviderCopy;
   now: number;
 }
 
-export function ThreadsTable({ threads, colors, selectedThreadId, now }: ThreadsTableProps) {
+export function ThreadsTable({ threads, colors, selectedThreadId, copy, now }: ThreadsTableProps) {
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
   const [query, setQuery] = useState('');
   const [filter, setFilter] = useState<ThreadFilter>('all');
@@ -227,6 +249,7 @@ export function ThreadsTable({ threads, colors, selectedThreadId, now }: Threads
         thread.projectPath ?? '',
         thread.primaryModel,
         thread.sourceLabel ?? '',
+        thread.reasoningEffort ?? '',
         thread.gitBranch ?? ''
       ].some((value) => value.toLowerCase().includes(normalized));
     });
@@ -293,7 +316,7 @@ export function ThreadsTable({ threads, colors, selectedThreadId, now }: Threads
       </header>
 
       {threads.length === 0 ? (
-        <div className="panel chart-empty">No chat usage has been indexed yet. Start a Codex chat and refresh.</div>
+        <div className="panel chart-empty">{copy.noThreads}</div>
       ) : visible.length === 0 ? (
         <div className="panel chart-empty">No chats match this search.</div>
       ) : (
@@ -336,6 +359,7 @@ export function ThreadsTable({ threads, colors, selectedThreadId, now }: Threads
                     </span>
                     <span className="thread-meta">
                       <span className={`source-tag ${thread.source}`}>{SOURCE_LABELS[thread.source] ?? 'Local'}</span>
+                      {thread.sourceLabel && thread.source !== 'exec' ? <span>{thread.sourceLabel}</span> : null}
                       {project ? <span>{project}</span> : null}
                       {thread.gitBranch ? <span className="branch">{thread.gitBranch}</span> : null}
                       {thread.titleSource === 'fallback' && thread.preview ? <span className="preview">{thread.preview}</span> : null}
@@ -359,7 +383,7 @@ export function ThreadsTable({ threads, colors, selectedThreadId, now }: Threads
                 </button>
                 {isExpanded ? (
                   <div id={`detail-${thread.threadId}`}>
-                    <ThreadDetail thread={thread} now={now} />
+                    <ThreadDetail thread={thread} copy={copy} now={now} />
                   </div>
                 ) : null}
               </article>

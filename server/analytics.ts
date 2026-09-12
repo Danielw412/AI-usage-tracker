@@ -1,12 +1,4 @@
-import {
-  countCloudTasksBetween,
-  getPromptRunsBetween,
-  getRateLimitHistory,
-  getThreadTitleMap,
-  getTokenEventsBetween,
-  type PromptRunRow,
-  type TokenEventRow
-} from './db.js';
+import type { PromptRunRow, TokenEventRow, UsageStore } from './db.js';
 import {
   RESET_DROP_THRESHOLD,
   attributeQuotaUsage,
@@ -21,6 +13,16 @@ import type {
   ThreadWindowUsage,
   WindowBreakdown
 } from './types.js';
+
+/**
+ * Which stored sample keys belong to each primary window. Providers that store
+ * several windows of the same duration (Claude's model-scoped weekly caps) use
+ * this to keep them apart; Codex leaves it empty and merges every source.
+ */
+export interface HistoryKeys {
+  fiveHour?: string[];
+  sevenDay?: string[];
+}
 
 const EMPTY_PROJECTION: LimitProjection = {
   projectedPercentAtReset: null,
@@ -120,8 +122,8 @@ export function calculateProjection(
   }
 
   const remainingSeconds = Math.max(0, current.resetsAt - now);
-  // Codex stops serving requests at the limit, so the reported value cannot keep
-  // climbing once it is there. Hold the projection at the current level.
+  // Providers stop serving requests at the limit, so the reported value cannot
+  // keep climbing once it is there. Hold the projection at the current level.
   const projected = current.usedPercent >= 100
     ? current.usedPercent
     : current.usedPercent + fit.slopePerSecond * remainingSeconds;
@@ -219,7 +221,7 @@ function groupHistory(history: RateLimitWindow[]): RateLimitWindow[][] {
   );
 }
 
-/** One sample series per reset bank, preferring the App Server source for charts. */
+/** One sample series per reset bank, preferring the polled source for charts. */
 export function groupWindowHistory(
   history: RateLimitWindow[],
   preferredKey: string
@@ -364,17 +366,19 @@ function bankRanges(
 }
 
 function estimateThreadUsageForWindow(
+  store: UsageStore,
   currentWindow: RateLimitWindow | null,
   durationMins: number,
   lookbackDays: number,
-  now: number
+  now: number,
+  keys?: string[]
 ): Map<string, ThreadWindowUsage> {
-  const history = getRateLimitHistory(durationMins, undefined, lookbackDays);
+  const history = store.getRateLimitHistory(durationMins, undefined, lookbackDays, keys);
   const banks = bankRanges(history, durationMins, now);
   if (banks.length === 0) return new Map();
 
   const earliest = Math.min(...banks.map((bank) => bank.start));
-  const allEvents = getTokenEventsBetween(earliest, now);
+  const allEvents = store.getTokenEventsBetween(earliest, now);
   const costPerToken = fallbackCostPerToken(allEvents);
   const result = new Map<string, ThreadWindowUsage>();
 
@@ -405,12 +409,18 @@ function estimateThreadUsageForWindow(
 }
 
 export function calculateThreadUsageEstimates(
+  store: UsageStore,
   fiveHourWindow: RateLimitWindow | null,
-  sevenDayWindow: RateLimitWindow | null
+  sevenDayWindow: RateLimitWindow | null,
+  keys: HistoryKeys = {}
 ): Map<string, { fiveHour: ThreadWindowUsage | null; sevenDay: ThreadWindowUsage | null }> {
   const now = Math.floor(Date.now() / 1000);
-  const fiveHour = estimateThreadUsageForWindow(fiveHourWindow, 300, THREAD_USAGE_LOOKBACK_DAYS, now);
-  const sevenDay = estimateThreadUsageForWindow(sevenDayWindow, 10_080, THREAD_USAGE_LOOKBACK_DAYS, now);
+  const fiveHour = estimateThreadUsageForWindow(
+    store, fiveHourWindow, 300, THREAD_USAGE_LOOKBACK_DAYS, now, keys.fiveHour
+  );
+  const sevenDay = estimateThreadUsageForWindow(
+    store, sevenDayWindow, 10_080, THREAD_USAGE_LOOKBACK_DAYS, now, keys.sevenDay
+  );
   const ids = new Set([...fiveHour.keys(), ...sevenDay.keys()]);
   return new Map(
     [...ids].map((threadId) => [threadId, {
@@ -422,6 +432,7 @@ export function calculateThreadUsageEstimates(
 
 /** Where the usage in the currently reported bank came from. */
 export function calculateWindowBreakdown(
+  store: UsageStore,
   current: RateLimitWindow | null,
   history: RateLimitWindow[],
   topThreads = 8
@@ -435,12 +446,12 @@ export function calculateWindowBreakdown(
     samples.push({ ...current, resetsAt: bankKey ?? current.resetsAt });
   }
   const windowStartsAt = current.resetsAt - current.windowDurationMins * 60;
-  const rawEvents = getTokenEventsBetween(windowStartsAt, now);
+  const rawEvents = store.getTokenEventsBetween(windowStartsAt, now);
   const attribution = attributeQuotaUsage(
     samples,
     toQuotaEvents(rawEvents, (event) => event.threadId)
   );
-  const titles = getThreadTitleMap();
+  const titles = store.getThreadTitleMap();
   const threads = [...attribution.byKey.entries()]
     .filter(([, row]) => row.percent > 0)
     .sort((a, b) => b[1].percent - a[1].percent)
@@ -453,7 +464,7 @@ export function calculateWindowBreakdown(
       coverage: coverageOf(row)
     }));
   const listed = new Set(threads.map((thread) => thread.threadId));
-  const activity = getPromptRunsBetween(windowStartsAt, now)
+  const activity = store.getPromptRunsBetween(windowStartsAt, now)
     .filter((run) => listed.has(run.threadId))
     .slice(0, 400)
     .map((run) => ({
@@ -471,7 +482,7 @@ export function calculateWindowBreakdown(
     samples: samples.length,
     threads,
     activity,
-    cloudTasksInWindow: countCloudTasksBetween(windowStartsAt, now)
+    cloudTasksInWindow: store.countCloudTasksBetween(windowStartsAt, now)
   };
 }
 
@@ -548,8 +559,8 @@ export function estimateModelEfficiencyForHistory(
 const AUTO_REVIEW_MODEL = 'codex-auto-review';
 
 /** Auto-review runs against the parent chat's model, so its tokens count toward that model. */
-function foldReviewEvents(events: TokenEventRow[]): TokenEventRow[] {
-  const primaryModels = getThreadTitleMap();
+function foldReviewEvents(store: UsageStore, events: TokenEventRow[]): TokenEventRow[] {
+  const primaryModels = store.getThreadTitleMap();
   return events.map((event) => {
     if (event.partKind !== 'reviewer' && event.model !== AUTO_REVIEW_MODEL) return event;
     const parentModel = primaryModels.get(event.threadId)?.model;
@@ -557,24 +568,25 @@ function foldReviewEvents(events: TokenEventRow[]): TokenEventRow[] {
   });
 }
 
-export function calculateModelEfficiency(): ModelEfficiency[] {
+export function calculateModelEfficiency(store: UsageStore, keys: HistoryKeys = {}): ModelEfficiency[] {
   const now = Math.floor(Date.now() / 1000);
   const since = now - MODEL_EFFICIENCY_LOOKBACK_DAYS * 86400;
-  const events = foldReviewEvents(getTokenEventsBetween(since, now));
-  const runs = getPromptRunsBetween(since, now);
+  const events = foldReviewEvents(store, store.getTokenEventsBetween(since, now));
+  const runs = store.getPromptRunsBetween(since, now);
   const fiveHour = estimateModelEfficiencyForHistory(
-    getRateLimitHistory(300, undefined, MODEL_EFFICIENCY_LOOKBACK_DAYS),
+    store.getRateLimitHistory(300, undefined, MODEL_EFFICIENCY_LOOKBACK_DAYS, keys.fiveHour),
     300,
     events,
     runs,
     now
   );
   if (fiveHour.length > 0) return fiveHour;
+  const longer = now - MODEL_EFFICIENCY_LOOKBACK_DAYS * 2 * 86400;
   return estimateModelEfficiencyForHistory(
-    getRateLimitHistory(10_080, undefined, MODEL_EFFICIENCY_LOOKBACK_DAYS * 2),
+    store.getRateLimitHistory(10_080, undefined, MODEL_EFFICIENCY_LOOKBACK_DAYS * 2, keys.sevenDay),
     10_080,
-    foldReviewEvents(getTokenEventsBetween(now - MODEL_EFFICIENCY_LOOKBACK_DAYS * 2 * 86400, now)),
-    getPromptRunsBetween(now - MODEL_EFFICIENCY_LOOKBACK_DAYS * 2 * 86400, now),
+    foldReviewEvents(store, store.getTokenEventsBetween(longer, now)),
+    store.getPromptRunsBetween(longer, now),
     now
   );
 }

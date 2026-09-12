@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
-import { getOverview, refreshOverview } from './api';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { getOverview, getProviders, refreshOverview } from './api';
 import { ActivityHeatmap, DailyTokenChart } from './components/Charts';
 import { CloudTasks } from './components/CloudTasks';
+import { ExtraLimits } from './components/ExtraLimits';
 import { ModelLedger } from './components/ModelLedger';
 import { StatStrip } from './components/StatStrip';
 import { ThreadsTable } from './components/ThreadsTable';
@@ -10,17 +11,42 @@ import { UsageChart, type UsageRange } from './components/UsageChart';
 import { WindowCard } from './components/WindowCard';
 import { percent } from './format';
 import { assignSeriesColors } from './palette';
-import type { DashboardOverview } from './types';
+import { DEFAULT_PROVIDER, PROVIDERS, isProviderId, type ProviderCopy } from './providers';
+import type { DashboardOverview, ProviderId, ProviderInfo } from './types';
 
 const SECTIONS: Section[] = ['overview', 'chats', 'models', 'cloud'];
+const PROVIDER_STORAGE_KEY = 'usage-dashboard.provider';
 
-function LoadingScreen() {
+function initialProvider(): ProviderId {
+  try {
+    const fromUrl = new URLSearchParams(window.location.search).get('provider');
+    if (isProviderId(fromUrl)) return fromUrl;
+    const stored = window.localStorage.getItem(PROVIDER_STORAGE_KEY);
+    if (isProviderId(stored)) return stored;
+  } catch {
+    // Private windows can refuse storage access; fall back to the default.
+  }
+  return DEFAULT_PROVIDER;
+}
+
+function rememberProvider(provider: ProviderId): void {
+  try {
+    window.localStorage.setItem(PROVIDER_STORAGE_KEY, provider);
+  } catch {
+    // Storage is a convenience only.
+  }
+  const url = new URL(window.location.href);
+  url.searchParams.set('provider', provider);
+  window.history.replaceState(null, '', url);
+}
+
+function LoadingScreen({ copy }: { copy: ProviderCopy }) {
   return (
     <main className="loading-screen" aria-busy="true">
       <div className="loading-card">
         <span className="wordmark-mark large" aria-hidden="true" />
-        <h1>Reading your Codex activity</h1>
-        <p>Indexing local session logs and asking Codex for the current limits.</p>
+        <h1>{copy.loading.title}</h1>
+        <p>{copy.loading.body}</p>
         <div className="loading-bars" aria-hidden="true"><span /><span /><span /></div>
       </div>
     </main>
@@ -45,7 +71,14 @@ function WindowToggle({ value, onChange }: { value: UsageRange; onChange: (value
   );
 }
 
+const FALLBACK_PROVIDERS: ProviderInfo[] = [
+  { id: 'codex', label: PROVIDERS.codex.label, enabled: true },
+  { id: 'claude', label: PROVIDERS.claude.label, enabled: true }
+];
+
 export default function App() {
+  const [provider, setProvider] = useState<ProviderId>(initialProvider);
+  const [providers, setProviders] = useState<ProviderInfo[]>(FALLBACK_PROVIDERS);
   const [overview, setOverview] = useState<DashboardOverview | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
@@ -53,29 +86,63 @@ export default function App() {
   const [activeSection, setActiveSection] = useState<Section>('overview');
   const [selectedThread, setSelectedThread] = useState<string | null>(null);
   const [now, setNow] = useState(() => Math.floor(Date.now() / 1000));
+  // Responses for a provider that is no longer selected are dropped.
+  const requestSequence = useRef(0);
+  const copy = PROVIDERS[provider];
 
   const load = useCallback(async (force = false) => {
+    const sequence = ++requestSequence.current;
     try {
       if (force) setRefreshing(true);
-      const next = force ? await refreshOverview() : await getOverview();
+      const next = force ? await refreshOverview(provider) : await getOverview(provider);
+      if (sequence !== requestSequence.current) return;
       setOverview(next);
       setError(null);
     } catch (caught) {
+      if (sequence !== requestSequence.current) return;
       setError((caught as Error).message);
     } finally {
-      setRefreshing(false);
+      if (sequence === requestSequence.current) setRefreshing(false);
     }
+  }, [provider]);
+
+  useEffect(() => {
+    let cancelled = false;
+    getProviders()
+      .then((result) => {
+        if (cancelled) return;
+        if (result.providers.length > 0) setProviders(result.providers);
+        const current = result.providers.find((item) => item.id === provider);
+        if (current && !current.enabled) {
+          const fallback = result.providers.find((item) => item.enabled)?.id ?? result.defaultProvider;
+          if (isProviderId(fallback) && fallback !== provider) setProvider(fallback);
+        }
+      })
+      .catch(() => {
+        // The overview request reports connectivity problems; the switch keeps its defaults.
+      });
+    return () => {
+      cancelled = true;
+    };
+    // Only on mount: later provider changes come from the switch itself.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
+    rememberProvider(provider);
+    setOverview(null);
+    setError(null);
+    setSelectedThread(null);
+    setActiveSection('overview');
     void load(false);
     const poll = window.setInterval(() => void load(false), 60_000);
+    return () => window.clearInterval(poll);
+  }, [provider, load]);
+
+  useEffect(() => {
     const tick = window.setInterval(() => setNow(Math.floor(Date.now() / 1000)), 30_000);
-    return () => {
-      window.clearInterval(poll);
-      window.clearInterval(tick);
-    };
-  }, [load]);
+    return () => window.clearInterval(tick);
+  }, []);
 
   useEffect(() => {
     if (!overview) return;
@@ -96,15 +163,18 @@ export default function App() {
   }, [overview]);
 
   useEffect(() => {
-    if (!overview) return;
+    if (!overview) {
+      document.title = copy.appName;
+      return;
+    }
     const five = overview.limits.fiveHour;
     const seven = overview.limits.sevenDay;
     const parts = [
       five ? `5h ${percent(five.usedPercent, 0)}` : null,
       seven ? `7d ${percent(seven.usedPercent, 0)}` : null
     ].filter(Boolean);
-    document.title = parts.length > 0 ? `${parts.join(' / ')} | Codex usage` : 'Codex usage';
-  }, [overview]);
+    document.title = parts.length > 0 ? `${parts.join(' / ')} | ${copy.appName}` : copy.appName;
+  }, [overview, copy]);
 
   const colors = useMemo(() => {
     if (!overview) return new Map<string, string>();
@@ -140,12 +210,19 @@ export default function App() {
     setActiveSection('chats');
   }, []);
 
+  const switchProvider = useCallback((next: ProviderId) => {
+    if (next === provider) return;
+    requestSequence.current += 1;
+    setRefreshing(false);
+    setProvider(next);
+  }, [provider]);
+
   const dailyData = useMemo(() => {
     if (!overview) return [];
     return overview.accountDailyUsage.length > 0 ? overview.accountDailyUsage : overview.localDailyUsage;
   }, [overview]);
 
-  if (!overview && !error) return <LoadingScreen />;
+  if (!overview && !error) return <LoadingScreen copy={copy} />;
 
   if (!overview) {
     return (
@@ -153,7 +230,14 @@ export default function App() {
         <div className="loading-card">
           <h1>The dashboard server is not answering</h1>
           <p>{error}</p>
-          <button className="button" type="button" onClick={() => void load(false)}>Try again</button>
+          <div className="loading-actions">
+            <button className="button" type="button" onClick={() => void load(false)}>Try again</button>
+            {providers.filter((item) => item.id !== provider && item.enabled).map((item) => (
+              <button key={item.id} className="button ghost" type="button" onClick={() => switchProvider(item.id)}>
+                Show {item.label}
+              </button>
+            ))}
+          </div>
         </div>
       </main>
     );
@@ -164,12 +248,16 @@ export default function App() {
   const selectedBreakdown = range === 'five' ? overview.breakdown.fiveHour : overview.breakdown.sevenDay;
 
   return (
-    <div className="app">
+    <div className="app" data-provider={provider}>
       <a className="skip-link" href="#overview">Skip to content</a>
       <Topbar
         active={activeSection}
         onNavigate={navigate}
-        connected={overview.connection.codexConnected}
+        provider={provider}
+        providers={providers}
+        onProviderChange={switchProvider}
+        copy={copy}
+        connected={overview.connection.connected}
         planType={overview.account.planType ?? overview.connection.planType}
         updatedAt={overview.generatedAt}
         refreshing={refreshing}
@@ -180,7 +268,7 @@ export default function App() {
         {error ? <div className="inline-alert" role="alert">{error}</div> : null}
         {overview.connection.error ? (
           <div className="inline-alert" role="status">
-            Codex connection: {overview.connection.error}
+            {copy.label} connection: {overview.connection.error}
           </div>
         ) : null}
 
@@ -193,6 +281,7 @@ export default function App() {
               projection={overview.projections.fiveHour}
               breakdown={overview.breakdown.fiveHour}
               colors={colors}
+              copy={copy}
               primary
               now={now}
               onSelectThread={selectThread}
@@ -204,10 +293,13 @@ export default function App() {
               projection={overview.projections.sevenDay}
               breakdown={overview.breakdown.sevenDay}
               colors={colors}
+              copy={copy}
               now={now}
               onSelectThread={selectThread}
             />
           </div>
+
+          <ExtraLimits windows={overview.limits.other} now={now} />
 
           <div className="panel usage-panel">
             <header className="panel-head">
@@ -228,13 +320,14 @@ export default function App() {
             />
           </div>
 
-          <StatStrip overview={overview} />
+          <StatStrip overview={overview} copy={copy} />
         </section>
 
         <ThreadsTable
           threads={overview.threads}
           colors={colors}
           selectedThreadId={selectedThread}
+          copy={copy}
           now={now}
         />
 
@@ -245,15 +338,15 @@ export default function App() {
           </header>
           <div className="models-grid">
             <DailyTokenChart data={dailyData} />
-            <ActivityHeatmap grid={overview.hourlyActivity} />
+            <ActivityHeatmap grid={overview.hourlyActivity} title={copy.heatmapTitle} />
           </div>
           <ModelLedger usage={overview.modelUsage} efficiency={overview.modelEfficiency} />
         </section>
 
-        <CloudTasks cloud={overview.cloudTasks} breakdown={overview.breakdown} now={now} />
+        <CloudTasks cloud={overview.cloudTasks} breakdown={overview.breakdown} copy={copy} now={now} />
 
         <footer className="page-foot">
-          <span>Percentages and reset times come from Codex. Chat shares and API-equivalent prices are local estimates.</span>
+          <span>{copy.footer}</span>
         </footer>
       </main>
     </div>

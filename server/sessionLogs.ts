@@ -1,17 +1,13 @@
 import crypto from 'node:crypto';
-import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import fs from 'node:fs';
 import readline from 'node:readline';
-import {
-  getSessionFileState,
-  insertRateLimitSnapshot,
-  replaceThreadData,
-  type StoredThreadEvent
-} from './db.js';
+import type { StoredThreadEvent, UsageStore } from './db.js';
 import { classifyThreadSource } from './codex/localThreadMetadata.js';
 import { cleanUserMessage, extractRawUserMessage } from './messageText.js';
 import { estimateUsageCost, findPricing } from './pricing.js';
+import { listFilesRecursive, scanSessionFiles, type ParsedSessionPart, type ScanResult } from './sessionScan.js';
 import type {
   PricingStatus,
   PromptMetric,
@@ -238,22 +234,6 @@ function extractRateLimitWindows(record: JsonRecord, observedAt: number): RateLi
   return result;
 }
 
-async function listJsonlFiles(root: string): Promise<string[]> {
-  const result: string[] = [];
-  if (!fs.existsSync(root)) return result;
-  const stack = [root];
-  while (stack.length) {
-    const current = stack.pop()!;
-    const entries = await fs.promises.readdir(current, { withFileTypes: true });
-    for (const entry of entries) {
-      const full = path.join(current, entry.name);
-      if (entry.isDirectory()) stack.push(full);
-      else if (entry.isFile() && entry.name.endsWith('.jsonl')) result.push(full);
-    }
-  }
-  return result;
-}
-
 interface PromptAccumulator extends PromptMetric {
   firstTokenAt: number | null;
   modelTokens: Map<string, number>;
@@ -262,12 +242,14 @@ interface PromptAccumulator extends PromptMetric {
   hasUnpriced: boolean;
 }
 
-interface ParsedSession {
-  summary: ThreadPartSummary;
-  events: StoredThreadEvent[];
-  prompts: PromptMetric[];
+export interface ParsedSession extends ParsedSessionPart {
+  limits: RateLimitWindow[];
 }
 
+/**
+ * Parse one Codex rollout file. Pure: it never touches the database, so the
+ * scanner (and tests) decide what to do with the result.
+ */
 export async function parseSessionFile(sourceFile: string): Promise<ParsedSession | null> {
   const stream = fs.createReadStream(sourceFile, { encoding: 'utf8' });
   const lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
@@ -291,6 +273,7 @@ export async function parseSessionFile(sourceFile: string): Promise<ParsedSessio
   const seenUserMessages = new Set<string>();
   const events: StoredThreadEvent[] = [];
   const prompts: PromptMetric[] = [];
+  const limits: RateLimitWindow[] = [];
   const totals = defaultUsage();
   const modelTokens = new Map<string, number>();
   const models = new Set<string>();
@@ -422,7 +405,7 @@ export async function parseSessionFile(sourceFile: string): Promise<ParsedSessio
     const usage = findIncrementalUsage(record);
     if (usage) {
       const observedAt = timestamp ?? updatedAt ?? Math.floor(Date.now() / 1000);
-      for (const limit of extractRateLimitWindows(record, observedAt)) insertRateLimitSnapshot(limit);
+      limits.push(...extractRateLimitWindows(record, observedAt));
       const cost = estimateUsageCost(currentModel, usage, observedAt);
       const eventKey = crypto
         .createHash('sha1')
@@ -487,75 +470,46 @@ export async function parseSessionFile(sourceFile: string): Promise<ParsedSessio
   const pricingStatus: PricingStatus =
     pricedEvents === 0 ? 'unknown' : unknownModels.length > 0 ? 'partial' : 'exact-model-match';
 
-  return {
-    summary: {
-      threadId: finalThreadId,
-      title: partKind === 'main' ? title : null,
-      projectPath,
-      startedAt,
-      updatedAt,
-      primaryModel,
-      models: [...models],
-      ...totals,
-      estimatedApiCostUsd: pricedEvents > 0 ? totalCost : null,
-      pricingStatus,
-      sourceFile,
-      partKind,
-      userMessageCount: partKind === 'main' ? userMessageCount : 0,
-      source,
-      sourceLabel
-    },
-    events,
-    prompts
+  const summary: ThreadPartSummary = {
+    threadId: finalThreadId,
+    title: partKind === 'main' ? title : null,
+    projectPath,
+    startedAt,
+    updatedAt,
+    primaryModel,
+    models: [...models],
+    ...totals,
+    estimatedApiCostUsd: pricedEvents > 0 ? totalCost : null,
+    pricingStatus,
+    sourceFile,
+    partKind,
+    userMessageCount: partKind === 'main' ? userMessageCount : 0,
+    source,
+    sourceLabel
   };
+
+  return { summary, events, prompts, limits };
 }
 
-export async function scanCodexSessions(): Promise<{
-  scanned: number;
-  updated: number;
-  errors: number;
-}> {
-  const codexHome = path.resolve(process.env.CODEX_HOME || path.join(os.homedir(), '.codex'));
+export function codexHomeDirectory(): string {
+  return path.resolve(process.env.CODEX_HOME || path.join(os.homedir(), '.codex'));
+}
+
+export async function scanCodexSessions(store: UsageStore): Promise<ScanResult> {
+  const codexHome = codexHomeDirectory();
   const roots = [path.join(codexHome, 'sessions'), path.join(codexHome, 'archived_sessions')];
-  const files = (await Promise.all(roots.map(listJsonlFiles))).flat();
-  const parserVersion = '6';
-  const markerPath = path.resolve(process.cwd(), 'data', '.session-parser-version');
-  const installedVersion = fs.existsSync(markerPath)
-    ? (await fs.promises.readFile(markerPath, 'utf8')).trim()
-    : '';
-  const forceRescan = installedVersion !== parserVersion;
-  let updated = 0;
-  let errors = 0;
-
-  for (const sourceFile of files) {
-    try {
-      const stat = await fs.promises.stat(sourceFile);
-      const previous = getSessionFileState(sourceFile);
-      if (
-        !forceRescan &&
-        previous &&
-        previous.modifiedMs === stat.mtimeMs &&
-        previous.sizeBytes === stat.size
-      ) {
-        continue;
-      }
+  const files = (
+    await Promise.all(roots.map((root) => listFilesRecursive(root, (_full, name) => name.endsWith('.jsonl'))))
+  ).flat();
+  return scanSessionFiles({
+    store,
+    files,
+    parserVersion: '6',
+    markerPath: path.resolve(process.cwd(), 'data', '.session-parser-version'),
+    label: 'Codex',
+    parse: async (sourceFile) => {
       const parsed = await parseSessionFile(sourceFile);
-      if (!parsed) continue;
-      replaceThreadData(parsed.summary, parsed.events, parsed.prompts, {
-        modifiedMs: stat.mtimeMs,
-        sizeBytes: stat.size
-      });
-      updated += 1;
-    } catch (error) {
-      errors += 1;
-      console.warn(`Failed to parse Codex session ${sourceFile}:`, error);
+      return parsed ? [parsed] : null;
     }
-  }
-
-  if (forceRescan && errors === 0) {
-    await fs.promises.mkdir(path.dirname(markerPath), { recursive: true });
-    await fs.promises.writeFile(markerPath, `${parserVersion}\n`, 'utf8');
-  }
-
-  return { scanned: files.length, updated, errors };
+  });
 }

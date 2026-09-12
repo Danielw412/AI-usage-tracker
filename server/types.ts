@@ -1,9 +1,30 @@
+/** Which local coding agent a dashboard payload describes. */
+export type ProviderId = 'codex' | 'claude';
+
+export interface ProviderInfo {
+  id: ProviderId;
+  /** Product name, e.g. "Codex" or "Claude Code". */
+  label: string;
+  /** False when the provider is turned off in configuration. */
+  enabled: boolean;
+}
+
 export interface TokenUsage {
+  /** Every prompt token sent upstream, including cache reads and cache writes. */
   inputTokens: number;
+  /** Prompt tokens served from the provider's prompt cache (a subset of inputTokens). */
   cachedInputTokens: number;
   outputTokens: number;
   reasoningOutputTokens: number;
   totalTokens: number;
+  /**
+   * Prompt tokens written to the cache at a premium rate (a subset of inputTokens,
+   * disjoint from cachedInputTokens). Only providers that bill cache writes
+   * separately report it; absent or zero otherwise.
+   */
+  cacheWriteInputTokens?: number;
+  /** Portion of cacheWriteInputTokens written with a one-hour lifetime. */
+  cacheWrite1hInputTokens?: number;
 }
 
 export interface RateLimitWindow {
@@ -40,10 +61,15 @@ export interface DailyUsage {
 
 export type SessionPartKind = 'main' | 'reviewer' | 'subagent';
 export type PricingStatus = 'exact-model-match' | 'partial' | 'unknown';
-export type TitleSource = 'codex-name' | 'codex-preview' | 'prompt' | 'fallback';
+/**
+ * Where a chat's title came from: a name generated or set inside the provider's
+ * own app, the provider's prompt preview, the first local prompt, or a label.
+ */
+export type TitleSource = 'generated' | 'preview' | 'prompt' | 'fallback';
 export type ThreadSource =
   | 'desktop'
   | 'cli'
+  | 'ide'
   | 'exec'
   | 'cloud'
   | 'voice'
@@ -84,6 +110,8 @@ export interface ThreadPartSummary extends TokenUsage {
   userMessageCount: number;
   source: ThreadSource;
   sourceLabel: string | null;
+  /** The provider's own cost figure for this part, when it records one locally. */
+  reportedCostUsd?: number | null;
 }
 
 /** Quota attributed to one thread inside a single reset bank. */
@@ -95,7 +123,7 @@ export interface ThreadWindowUsage {
   sharedPercent: number;
   spans: number;
   windowResetsAt: number;
-  /** True when the bank is the window Codex is reporting right now. */
+  /** True when the bank is the window the provider is reporting right now. */
   current: boolean;
 }
 
@@ -123,6 +151,8 @@ export interface ThreadSummary extends TokenUsage {
   reviewerTokens: number;
   subagentTokens: number;
   partCount: number;
+  /** Cost the provider itself recorded for the chat, when available (Claude Code writes one). */
+  reportedCostUsd: number | null;
   prompts: PromptMetric[];
   usage: {
     fiveHour: ThreadWindowUsage | null;
@@ -198,12 +228,27 @@ export interface AccountSummary {
   longestRunningTurnSec: number | null;
   currentStreakDays: number | null;
   longestStreakDays: number | null;
+  /**
+   * Whether the lifetime figures above came from the provider's account API or
+   * were computed from local logs. Local figures only cover what this machine saw.
+   */
+  statsSource: 'account' | 'local' | 'none';
+  /** Pay-as-you-go overage on top of the plan, when the provider exposes it. */
+  extraUsage: {
+    enabled: boolean;
+    usedPercent: number | null;
+    usedUsd: number | null;
+    limitUsd: number | null;
+  } | null;
 }
 
+export type CloudTaskStatus = 'available' | 'unavailable' | 'disabled' | 'unsupported';
+
 export interface DashboardOverview {
+  provider: ProviderId;
   generatedAt: number;
   connection: {
-    codexConnected: boolean;
+    connected: boolean;
     authType: string | null;
     planType: string | null;
     error: string | null;
@@ -212,6 +257,7 @@ export interface DashboardOverview {
   limits: {
     fiveHour: RateLimitWindow | null;
     sevenDay: RateLimitWindow | null;
+    /** Additional windows the provider reports, such as model-specific weekly caps. */
     other: RateLimitWindow[];
     fiveHourStatus: 'available' | 'not-reported';
   };
@@ -241,7 +287,7 @@ export interface DashboardOverview {
   modelEfficiency: ModelEfficiency[];
   modelUsage: ModelUsageSummary[];
   cloudTasks: {
-    status: 'available' | 'unavailable' | 'disabled';
+    status: CloudTaskStatus;
     checkedAt: number | null;
     tasks: CloudTask[];
   };

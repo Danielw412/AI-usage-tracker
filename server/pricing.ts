@@ -12,18 +12,21 @@ interface PricingRate {
   inputPerMillion: number;
   cachedInputPerMillion: number;
   outputPerMillion: number;
+  /** Price of writing a prompt prefix to the cache (5-minute lifetime). Defaults to the input price. */
+  cacheWritePerMillion?: number;
+  /** Price of a one-hour cache write. Defaults to the 5-minute write price. */
+  cacheWrite1hPerMillion?: number;
 }
 
 interface PriceChange extends PricingRate {
   effectiveFrom: string;
 }
 
-export interface ModelPricing {
+export interface ModelPricing extends PricingRate {
   id: string;
   aliases: string[];
-  inputPerMillion: PricingRate['inputPerMillion'];
-  cachedInputPerMillion: PricingRate['cachedInputPerMillion'];
-  outputPerMillion: PricingRate['outputPerMillion'];
+  /** Which provider bills this model; informational. */
+  provider?: 'openai' | 'anthropic';
   longContext?: LongContextRule;
   priceChanges?: PriceChange[];
 }
@@ -46,8 +49,9 @@ export function loadPricingConfig(): PricingConfig {
   return cachedConfig;
 }
 
-function normalizeModelName(model: string): string {
-  return model.trim().toLowerCase();
+/** Lower-case, and drop context-size markers such as the `[1m]` Claude Code appends. */
+export function normalizeModelName(model: string): string {
+  return model.trim().toLowerCase().replace(/\[[^\]]*\]$/, '').trim();
 }
 
 function parseEffectiveTimestamp(effectiveFrom: string): number | null {
@@ -93,9 +97,21 @@ export function estimateUsageCost(
   const rate = selectPricingRate(pricing, observedAt);
 
   const cached = Math.min(usage.cachedInputTokens, usage.inputTokens);
-  const uncached = Math.max(0, usage.inputTokens - cached);
+  const cacheWrite = Math.max(
+    0,
+    Math.min(usage.cacheWriteInputTokens ?? 0, usage.inputTokens - cached)
+  );
+  const cacheWrite1h = Math.max(0, Math.min(usage.cacheWrite1hInputTokens ?? 0, cacheWrite));
+  const cacheWrite5m = cacheWrite - cacheWrite1h;
+  const uncached = Math.max(0, usage.inputTokens - cached - cacheWrite);
+  const write5mRate = rate.cacheWritePerMillion ?? rate.inputPerMillion;
+  const write1hRate = rate.cacheWrite1hPerMillion ?? write5mRate;
+
   let inputCost =
-    (uncached * rate.inputPerMillion + cached * rate.cachedInputPerMillion) /
+    (uncached * rate.inputPerMillion +
+      cached * rate.cachedInputPerMillion +
+      cacheWrite5m * write5mRate +
+      cacheWrite1h * write1hRate) /
     1_000_000;
   let outputCost = (usage.outputTokens * rate.outputPerMillion) / 1_000_000;
 

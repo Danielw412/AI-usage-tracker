@@ -22,6 +22,7 @@
   --ramp-1: #b7cacf;
   --ramp-2: #6f96a1;
   --ramp-3: #355a64;
+  --ramp-4: #8fb0b8;
   --radius-lg: 14px;
   --radius: 8px;
   --radius-sm: 5px;
@@ -1818,5 +1819,143 @@ a {
 
   .heatmap-cell {
     min-height: 8px;
+  }
+}
+
+/* ------------------------------------------------------------------
+   Provider switch (Codex / Claude Code)
+   ------------------------------------------------------------------ */
+.topbar-brand {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  min-width: 0;
+}
+
+.provider-switch {
+  padding: 2px;
+}
+
+.provider-switch button {
+  padding: 4px 10px;
+  font-size: 12.5px;
+  white-space: nowrap;
+}
+
+.provider-switch button:disabled {
+  color: var(--ink-3);
+  cursor: not-allowed;
+}
+
+.loading-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 10px;
+  margin-top: 18px;
+}
+
+.loading-card .loading-actions .button {
+  margin-top: 0;
+}
+
+/* ------------------------------------------------------------------
+   Extra limits (model-specific weekly caps and other reported windows)
+   ------------------------------------------------------------------ */
+.extra-limits {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 12px;
+  margin: -6px 0 20px;
+  padding: 0;
+  list-style: none;
+}
+
+.extra-limit {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas:
+    "label value"
+    "meter meter"
+    "reset reset";
+  gap: 6px 12px;
+  padding: 12px 16px;
+  background: var(--surface);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius);
+}
+
+.extra-limit-label {
+  grid-area: label;
+  overflow: hidden;
+  color: var(--ink-2);
+  font-size: 12.5px;
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.extra-limit-value {
+  grid-area: value;
+  font-size: 15px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+
+.extra-limit.is-over .extra-limit-value {
+  color: var(--danger);
+}
+
+.extra-limit-meter {
+  grid-area: meter;
+  display: block;
+  height: 5px;
+  overflow: hidden;
+  background: var(--bg);
+  border-radius: 999px;
+}
+
+.extra-limit-meter i {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  border-radius: 999px;
+}
+
+.extra-limit.is-over .extra-limit-meter i {
+  background: var(--danger);
+}
+
+.extra-limit-reset {
+  grid-area: reset;
+  color: var(--ink-3);
+  font-size: 11.5px;
+}
+
+.source-tag.ide {
+  background: var(--accent-tint);
+  border-color: transparent;
+  color: var(--accent-strong);
+}
+
+.detail-list li small.detail-hint {
+  margin-left: 6px;
+}
+
+@media (max-width: 960px) {
+  .topbar-brand {
+    gap: 12px;
+  }
+}
+
+@media (max-width: 640px) {
+  .topbar-brand {
+    flex-wrap: wrap;
+    gap: 8px 12px;
+  }
+
+  .extra-limits {
+    grid-template-columns: minmax(0, 1fr);
   }
 }

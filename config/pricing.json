@@ -1,10 +1,11 @@
 {
-  "updatedAt": "2026-09-05",
+  "updatedAt": "2026-09-11",
   "currency": "USD",
   "models": [
     {
       "id": "gpt-6-astra",
       "aliases": ["gpt-6-astra"],
+      "provider": "openai",
       "inputPerMillion": 10,
       "cachedInputPerMillion": 1,
       "outputPerMillion": 50,
@@ -13,6 +14,7 @@
     {
       "id": "gpt-5.6-sol",
       "aliases": ["gpt-5.6", "gpt-5.6-sol"],
+      "provider": "openai",
       "inputPerMillion": 5,
       "cachedInputPerMillion": 0.5,
       "outputPerMillion": 30,
@@ -21,6 +23,7 @@
     {
       "id": "gpt-5.6-terra",
       "aliases": ["gpt-5.6-terra"],
+      "provider": "openai",
       "inputPerMillion": 2.5,
       "cachedInputPerMillion": 0.25,
       "outputPerMillion": 15,
@@ -37,6 +40,7 @@
     {
       "id": "gpt-5.6-luna",
       "aliases": ["gpt-5.6-luna"],
+      "provider": "openai",
       "inputPerMillion": 1,
       "cachedInputPerMillion": 0.1,
       "outputPerMillion": 6,
@@ -53,6 +57,7 @@
     {
       "id": "gpt-5.5",
       "aliases": ["gpt-5.5"],
+      "provider": "openai",
       "inputPerMillion": 5,
       "cachedInputPerMillion": 0.5,
       "outputPerMillion": 30
@@ -60,6 +65,7 @@
     {
       "id": "gpt-5.4",
       "aliases": ["gpt-5.4"],
+      "provider": "openai",
       "inputPerMillion": 2.5,
       "cachedInputPerMillion": 0.25,
       "outputPerMillion": 15,
@@ -68,6 +74,7 @@
     {
       "id": "gpt-5.4-mini",
       "aliases": ["gpt-5.4-mini"],
+      "provider": "openai",
       "inputPerMillion": 0.75,
       "cachedInputPerMillion": 0.075,
       "outputPerMillion": 4.5
@@ -75,6 +82,7 @@
     {
       "id": "gpt-5.2-codex",
       "aliases": ["gpt-5.2-codex"],
+      "provider": "openai",
       "inputPerMillion": 1.75,
       "cachedInputPerMillion": 0.175,
       "outputPerMillion": 14
@@ -82,9 +90,162 @@
     {
       "id": "gpt-5-codex",
       "aliases": ["gpt-5-codex", "gpt-5.1-codex"],
+      "provider": "openai",
       "inputPerMillion": 1.25,
       "cachedInputPerMillion": 0.125,
       "outputPerMillion": 10
+    },
+    {
+      "id": "claude-fable-5-1",
+      "aliases": ["claude-fable-5-1", "claude-mythos-5-1"],
+      "provider": "anthropic",
+      "inputPerMillion": 10,
+      "cachedInputPerMillion": 0.25,
+      "cacheWritePerMillion": 12.5,
+      "cacheWrite1hPerMillion": 20,
+      "outputPerMillion": 50
+    },
+    {
+      "id": "claude-fable-5",
+      "aliases": ["claude-fable-5", "claude-mythos-5"],
+      "provider": "anthropic",
+      "inputPerMillion": 10,
+      "cachedInputPerMillion": 1,
+      "cacheWritePerMillion": 12.5,
+      "cacheWrite1hPerMillion": 20,
+      "outputPerMillion": 50
+    },
+    {
+      "id": "claude-opus-5",
+      "aliases": ["claude-opus-5"],
+      "provider": "anthropic",
+      "inputPerMillion": 5,
+      "cachedInputPerMillion": 0.5,
+      "cacheWritePerMillion": 6.25,
+      "cacheWrite1hPerMillion": 10,
+      "outputPerMillion": 25
+    },
+    {
+      "id": "claude-opus-4-8",
+      "aliases": ["claude-opus-4-8"],
+      "provider": "anthropic",
+      "inputPerMillion": 5,
+      "cachedInputPerMillion": 0.5,
+      "cacheWritePerMillion": 6.25,
+      "cacheWrite1hPerMillion": 10,
+      "outputPerMillion": 25
+    },
+    {
+      "id": "claude-opus-4-7",
+      "aliases": ["claude-opus-4-7"],
+      "provider": "anthropic",
+      "inputPerMillion": 5,
+      "cachedInputPerMillion": 0.5,
+      "cacheWritePerMillion": 6.25,
+      "cacheWrite1hPerMillion": 10,
+      "outputPerMillion": 25
+    },
+    {
+      "id": "claude-opus-4-6",
+      "aliases": ["claude-opus-4-6"],
+      "provider": "anthropic",
+      "inputPerMillion": 5,
+      "cachedInputPerMillion": 0.5,
+      "cacheWritePerMillion": 6.25,
+      "cacheWrite1hPerMillion": 10,
+      "outputPerMillion": 25
+    },
+    {
+      "id": "claude-opus-4-5",
+      "aliases": ["claude-opus-4-5", "claude-opus-4-5-20251101"],
+      "provider": "anthropic",
+      "inputPerMillion": 5,
+      "cachedInputPerMillion": 0.5,
+      "cacheWritePerMillion": 6.25,
+      "cacheWrite1hPerMillion": 10,
+      "outputPerMillion": 25
+    },
+    {
+      "id": "claude-opus-4-1-20250805",
+      "aliases": ["claude-opus-4-1-20250805"],
+      "provider": "anthropic",
+      "inputPerMillion": 15,
+      "cachedInputPerMillion": 1.5,
+      "cacheWritePerMillion": 18.75,
+      "cacheWrite1hPerMillion": 30,
+      "outputPerMillion": 75
+    },
+    {
+      "id": "claude-opus-4-20250514",
+      "aliases": ["claude-opus-4-20250514"],
+      "provider": "anthropic",
+      "inputPerMillion": 15,
+      "cachedInputPerMillion": 1.5,
+      "cacheWritePerMillion": 18.75,
+      "cacheWrite1hPerMillion": 30,
+      "outputPerMillion": 75
+    },
+    {
+      "id": "claude-sonnet-5",
+      "aliases": ["claude-sonnet-5"],
+      "provider": "anthropic",
+      "inputPerMillion": 2,
+      "cachedInputPerMillion": 0.2,
+      "cacheWritePerMillion": 2.5,
+      "cacheWrite1hPerMillion": 4,
+      "outputPerMillion": 10
+    },
+    {
+      "id": "claude-sonnet-4-6",
+      "aliases": ["claude-sonnet-4-6"],
+      "provider": "anthropic",
+      "inputPerMillion": 3,
+      "cachedInputPerMillion": 0.3,
+      "cacheWritePerMillion": 3.75,
+      "cacheWrite1hPerMillion": 6,
+      "outputPerMillion": 15
+    },
+    {
+      "id": "claude-sonnet-4-5",
+      "aliases": ["claude-sonnet-4-5", "claude-sonnet-4-5-20250929"],
+      "provider": "anthropic",
+      "inputPerMillion": 3,
+      "cachedInputPerMillion": 0.3,
+      "cacheWritePerMillion": 3.75,
+      "cacheWrite1hPerMillion": 6,
+      "outputPerMillion": 15,
+      "longContext": { "thresholdTokens": 200000, "inputMultiplier": 2, "outputMultiplier": 1.5 }
+    },
+    {
+      "id": "claude-sonnet-4-20250514",
+      "aliases": ["claude-sonnet-4-20250514"],
+      "provider": "anthropic",
+      "inputPerMillion": 3,
+      "cachedInputPerMillion": 0.3,
+      "cacheWritePerMillion": 3.75,
+      "cacheWrite1hPerMillion": 6,
+      "outputPerMillion": 15,
+      "longContext": { "thresholdTokens": 200000, "inputMultiplier": 2, "outputMultiplier": 1.5 }
+    },
+    {
+      "id": "claude-haiku-4-5",
+      "aliases": ["claude-haiku-4-5", "claude-haiku-4-5-20251001"],
+      "provider": "anthropic",
+      "inputPerMillion": 1,
+      "cachedInputPerMillion": 0.1,
+      "cacheWritePerMillion": 1.25,
+      "cacheWrite1hPerMillion": 2,
+      "outputPerMillion": 5
+    },
+    {
+      "id": "claude-3-5-haiku-20241022",
+      "aliases": ["claude-3-5-haiku-20241022", "claude-3-5-haiku-latest"],
+      "provider": "anthropic",
+      "inputPerMillion": 0.8,
+      "cachedInputPerMillion": 0.08,
+      "cacheWritePerMillion": 1,
+      "cacheWrite1hPerMillion": 1.6,
+      "outputPerMillion": 4
     }
   ]
 }

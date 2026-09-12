@@ -106,7 +106,7 @@ export function DailyTokenChart({ data, days = 14 }: { data: DailyUsage[]; days?
 const HOURS = Array.from({ length: 24 }, (_, hour) => hour);
 const DAY_ORDER = [1, 2, 3, 4, 5, 6, 0];
 
-export function ActivityHeatmap({ grid }: { grid: number[][] }) {
+export function ActivityHeatmap({ grid, title }: { grid: number[][]; title: string }) {
   const max = Math.max(0, ...grid.flat());
   const total = grid.flat().reduce((sum, value) => sum + value, 0);
   const busiest = useMemo(() => {
@@ -123,7 +123,7 @@ export function ActivityHeatmap({ grid }: { grid: number[][] }) {
     <section className="panel chart-panel" aria-labelledby="heatmap-title">
       <header className="panel-head">
         <div>
-          <h3 id="heatmap-title">When you use Codex</h3>
+          <h3 id="heatmap-title">{title}</h3>
           <p>Tokens by weekday and hour, last 30 days</p>
         </div>
         {total > 0 ? (
