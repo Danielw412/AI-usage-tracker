@@ -27,5 +27,7 @@ export function isProviderId(value: unknown): value is ProviderId {
 }
 
 export function debugEnabled(): boolean {
-  return process.env.DEBUG_CODEX_DASHBOARD === 'true' || process.env.DEBUG_USAGE_DASHBOARD === 'true';
+  return process.env.DEBUG_AI_USAGE_TRACKER === 'true'
+    || process.env.DEBUG_CODEX_DASHBOARD === 'true'
+    || process.env.DEBUG_USAGE_DASHBOARD === 'true';
 }

@@ -1,8 +1,8 @@
-# Codex Usage Dashboard
+# AI Usage Tracker
 
-A local dashboard for tracking quota windows, token history, API-equivalent token cost, and estimated model efficiency for two coding agents: **OpenAI Codex** and **Anthropic Claude Code**. A switch in the top bar flips the whole page between them.
+A local AI Usage Tracker for quota windows, token history, API-equivalent token cost, and estimated model efficiency for two coding agents: **OpenAI Codex** and **Anthropic Claude Code**. A switch in the top bar flips the whole page between them.
 
-The dashboard runs entirely on your computer. For Codex it starts `codex app-server`, reads account-level quota information, and scans local Codex session logs. For Claude Code it asks the same usage endpoint that Claude Code's `/usage` screen uses, and scans the local session transcripts Claude Code writes. Each provider keeps its own SQLite history.
+AI Usage Tracker runs entirely on your computer. For Codex it starts `codex app-server`, reads account-level quota information, and scans local Codex session logs. For Claude Code it asks the same usage endpoint that Claude Code's `/usage` screen uses, and scans the local session transcripts Claude Code writes. Each provider keeps its own SQLite history.
 
 ## What it shows
 
@@ -52,7 +52,7 @@ Then open:
 http://localhost:5173
 ```
 
-The frontend runs on port 5173 and proxies `/api` requests to the local backend on port 8787. Add `?provider=claude` to the URL to open the Claude Code view directly; the last choice is remembered in the browser.
+The frontend runs on port 5173 and proxies `/api` requests to the local backend on port 8893. Add `?provider=claude` to the URL to open the Claude Code view directly; the last choice is remembered in the browser.
 
 ## Run the production build
 
@@ -65,8 +65,16 @@ npm start
 Then open:
 
 ```text
-http://localhost:8787
+http://localhost:8893
 ```
+
+### Start automatically on Windows
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install-autostart.ps1
+```
+
+This registers the `AI Usage Tracker` scheduled task, which runs `scripts\start-ai-usage-tracker.ps1` at every sign-in, and starts it right away. Rerun it whenever a script is renamed or moved; it also removes the old `Codex Usage Dashboard` task. To restart the tracker after a build, run `Start-ScheduledTask -TaskName "AI Usage Tracker"`; the start script replaces whatever tracker is already holding the port.
 
 ## Test the interface without live data
 
@@ -100,8 +108,8 @@ Copy `.env.example` to `.env`. Supported values:
 | `CLAUDE_USAGE_POLL_MS` | `120000` | Claude usage endpoint polling interval. |
 | `CLAUDE_SESSION_SCAN_MS` | `SESSION_SCAN_MS` | Claude transcript scan interval. |
 | `DEMO_MODE` | `false` | Use generated sample data. |
-| `PORT` | `8787` | Backend and production-web port. |
-| `DEBUG_USAGE_DASHBOARD` | `false` | Print adapter and parser diagnostics (`DEBUG_CODEX_DASHBOARD` still works). |
+| `PORT` | `8893` | Backend and production-web port. |
+| `DEBUG_AI_USAGE_TRACKER` | `false` | Print adapter and parser diagnostics (`DEBUG_USAGE_DASHBOARD` and `DEBUG_CODEX_DASHBOARD` remain accepted for compatibility). |
 
 On Windows, folder paths can be written as:
 
@@ -113,13 +121,13 @@ CLAUDE_CONFIG_DIR=C:\Users\YourName\.claude
 ## Project structure
 
 ```text
-codex-usage-dashboard/
+ai-usage-tracker/
 ├─ config/
 │  └─ pricing.json              API token prices (OpenAI and Anthropic) and model aliases
 ├─ scripts/
 │  ├─ claude-statusline-sample.mjs  Optional Claude Code status-line hook that feeds quota samples
 │  ├─ install-autostart.ps1     Windows scheduled task
-│  └─ start-dashboard.ps1
+│  └─ start-ai-usage-tracker.ps1
 ├─ server/
 │  ├─ codex/
 │  │  ├─ AppServerClient.ts     JSON-RPC client for codex app-server
@@ -314,7 +322,9 @@ CODEX_BIN=C:\path\to\codex.exe
 
 ### Dashboard says Codex is disconnected
 
-Run `codex` directly first and confirm it is signed in. Set `DEBUG_USAGE_DASHBOARD=true`, restart the dashboard, and inspect the terminal output.
+Run `codex` directly first and confirm it is signed in. Set `DEBUG_AI_USAGE_TRACKER=true`, restart AI Usage Tracker, and inspect the terminal output.
+
+If the error says the tracker is not allowed to launch `codex` (`spawn EPERM`), the server was started from a coding agent's sandboxed shell, for example a Codex desktop session running `npm start`. Processes started there inherit the sandbox and cannot launch `codex app-server` (or sometimes reach the network). Restart the tracker with `Start-ScheduledTask -TaskName "AI Usage Tracker"` so it runs outside the sandbox.
 
 ### Dashboard says the Claude Code sign-in was not found or has expired
 

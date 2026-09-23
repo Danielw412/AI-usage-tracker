@@ -37,7 +37,7 @@ export async function fetchClaudeUsage(accessToken: string, timeoutMs = 15_000):
         Authorization: `Bearer ${accessToken}`,
         'anthropic-beta': OAUTH_BETA_HEADER,
         Accept: 'application/json',
-        'User-Agent': 'codex-usage-dashboard'
+        'User-Agent': 'ai-usage-tracker'
       },
       signal: controller.signal
     });

@@ -1,5 +1,5 @@
 {
-  "updatedAt": "2026-09-11",
+  "updatedAt": "2026-09-22",
   "currency": "USD",
   "models": [
     {
@@ -9,6 +9,24 @@
       "inputPerMillion": 10,
       "cachedInputPerMillion": 1,
       "outputPerMillion": 50,
+      "longContext": { "thresholdTokens": 272000, "inputMultiplier": 2, "outputMultiplier": 1.5 }
+    },
+    {
+      "id": "gpt-6-sol",
+      "aliases": ["gpt-6-sol"],
+      "provider": "openai",
+      "inputPerMillion": 2,
+      "cachedInputPerMillion": 0.2,
+      "outputPerMillion": 10,
+      "longContext": { "thresholdTokens": 272000, "inputMultiplier": 2, "outputMultiplier": 1.5 }
+    },
+    {
+      "id": "gpt-6-luna",
+      "aliases": ["gpt-6-luna"],
+      "provider": "openai",
+      "inputPerMillion": 0.1,
+      "cachedInputPerMillion": 0.01,
+      "outputPerMillion": 0.5,
       "longContext": { "thresholdTokens": 272000, "inputMultiplier": 2, "outputMultiplier": 1.5 }
     },
     {

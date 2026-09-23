@@ -192,21 +192,22 @@ a {
   text-decoration: none;
 }
 
-.wordmark-mark {
-  display: inline-block;
-  width: 16px;
-  height: 16px;
-  border-radius: 50%;
-  background: conic-gradient(var(--accent) 0 72%, var(--line) 72% 100%);
-  -webkit-mask: radial-gradient(circle, transparent 0 4px, #000 4.5px);
-  mask: radial-gradient(circle, transparent 0 4px, #000 4.5px);
+.brand-logo {
+  display: block;
+  width: 24px;
+  height: 24px;
+  flex: 0 0 auto;
+  object-fit: cover;
+  border: 1px solid var(--line-soft);
+  border-radius: 7px;
+  background: var(--surface);
+  box-shadow: 0 1px 2px rgba(32, 36, 38, 0.08);
 }
 
-.wordmark-mark.large {
-  width: 28px;
-  height: 28px;
-  -webkit-mask: radial-gradient(circle, transparent 0 7px, #000 7.5px);
-  mask: radial-gradient(circle, transparent 0 7px, #000 7.5px);
+.brand-logo-large {
+  width: 44px;
+  height: 44px;
+  border-radius: 12px;
 }
 
 .topnav {

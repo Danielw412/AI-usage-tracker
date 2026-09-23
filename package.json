@@ -1,5 +1,5 @@
 {
-  "name": "codex-usage-dashboard",
+  "name": "ai-usage-tracker",
   "private": true,
   "version": "0.1.0",
   "type": "module",
@@ -29,7 +29,7 @@
     "typescript": "^5.9.2",
     "vite": "^7.1.4"
   },
-  "description": "Local dashboard for Codex quota windows, token history, API-equivalent cost, and model efficiency.",
+  "description": "Local AI usage tracker for Codex and Claude Code quota windows, token history, API-equivalent cost, and model efficiency.",
   "engines": {
     "node": ">=22.5.0"
   }

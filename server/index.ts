@@ -23,7 +23,7 @@ function flagEnv(name: string, fallback: boolean): boolean {
   return !/^(false|0|no|off)$/i.test(value.trim());
 }
 
-const port = Number(process.env.PORT || 8787);
+const port = Number(process.env.PORT || 8893);
 const demoMode = process.env.DEMO_MODE === 'true';
 
 const providers: Record<ProviderId, Provider> = {
@@ -118,7 +118,7 @@ app.use((request, response, next) => {
 
 app.listen(port, () => {
   const enabled = Object.values(providers).filter((provider) => provider.enabled).map((provider) => provider.label);
-  console.log(`Usage Dashboard server: http://localhost:${port} (${enabled.join(', ') || 'no providers enabled'})`);
+  console.log(`AI Usage Tracker server: http://localhost:${port} (${enabled.join(', ') || 'no providers enabled'})`);
   if (demoMode) console.log('DEMO_MODE is enabled.');
 });
 

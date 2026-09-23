@@ -62,11 +62,22 @@ export class AppServerClient extends EventEmitter {
     const args = ['app-server', '--listen', 'stdio://'];
     this.lastError = null;
 
-    const child = spawn(binary, args, {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      windowsHide: true,
-      shell: process.platform === 'win32'
-    });
+    let child: ChildProcessWithoutNullStreams;
+    try {
+      child = spawn(binary, args, {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        windowsHide: true,
+        shell: process.platform === 'win32'
+      });
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      // A bare "spawn EPERM" means this process may not launch programs at all,
+      // which is what happens when an agent's sandboxed shell started the tracker.
+      this.lastError = code === 'EPERM' || code === 'EACCES'
+        ? `This tracker process is not allowed to launch ${binary} (${code}). It was probably started from a sandboxed agent shell; restart it with the "AI Usage Tracker" scheduled task or scripts/start-ai-usage-tracker.ps1.`
+        : (error as Error).message;
+      throw new Error(this.lastError);
+    }
     this.process = child;
 
     const output = readline.createInterface({ input: child.stdout });
@@ -78,6 +89,7 @@ export class AppServerClient extends EventEmitter {
     });
 
     child.on('error', (error) => {
+      if (this.process !== child) return;
       this.lastError = error.message;
       this.rejectAll(error);
       this.process = null;
@@ -85,6 +97,8 @@ export class AppServerClient extends EventEmitter {
     });
 
     child.on('exit', (code, signal) => {
+      // A replaced app-server exiting late must not tear down its successor.
+      if (this.process !== child) return;
       const error = new Error(`codex app-server exited (${code ?? signal ?? 'unknown'})`);
       this.lastError = error.message;
       this.rejectAll(error);
@@ -92,21 +106,28 @@ export class AppServerClient extends EventEmitter {
       this.emit('disconnect', error);
     });
 
-    await this.request('initialize', {
-      clientInfo: {
-        name: 'codex_usage_dashboard',
-        title: 'Codex Usage Dashboard',
-        version: '0.1.0'
-      },
-      capabilities: {
-        experimentalApi: false,
-        optOutNotificationMethods: [
-          'thread/started',
-          'item/agentMessage/delta',
-          'item/reasoning/summaryTextDelta'
-        ]
-      }
-    });
+    try {
+      await this.request('initialize', {
+        clientInfo: {
+          name: 'ai_usage_tracker',
+          title: 'AI Usage Tracker',
+          version: '0.1.0'
+        },
+        capabilities: {
+          experimentalApi: false,
+          optOutNotificationMethods: [
+            'thread/started',
+            'item/agentMessage/delta',
+            'item/reasoning/summaryTextDelta'
+          ]
+        }
+      });
+    } catch (error) {
+      // Left running, an app-server that never initialized looks connected and
+      // rejects every later request, so drop it and let the next poll start fresh.
+      if (this.process === child) this.stop();
+      throw error;
+    }
     this.notify('initialized', {});
   }
 
@@ -140,6 +161,7 @@ export class AppServerClient extends EventEmitter {
   stop(): void {
     this.process?.kill();
     this.process = null;
+    this.rejectAll(new Error('Codex app-server stopped'));
   }
 
   private getLocalThreadTitles(): Map<string, string> {

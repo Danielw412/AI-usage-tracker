@@ -1,4 +1,5 @@
 import { RefreshCw } from 'lucide-react';
+import { BrandLogo } from './BrandLogo';
 import { clock, sentence } from '../format';
 import type { ProviderCopy } from '../providers';
 import type { ProviderId, ProviderInfo } from '../types';
@@ -44,7 +45,7 @@ export function Topbar({
       <div className="topbar-inner">
         <div className="topbar-brand">
           <a className="wordmark" href="#overview" onClick={(event) => { event.preventDefault(); onNavigate('overview'); }}>
-            <span className="wordmark-mark" aria-hidden="true" />
+            <BrandLogo />
             <span>{copy.appName}</span>
           </a>
           <div className="segmented provider-switch" role="group" aria-label="Provider">

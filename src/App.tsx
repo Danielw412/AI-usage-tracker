@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { getOverview, getProviders, refreshOverview } from './api';
 import { ActivityHeatmap, DailyTokenChart } from './components/Charts';
+import { BrandLogo } from './components/BrandLogo';
 import { CloudTasks } from './components/CloudTasks';
 import { ExtraLimits } from './components/ExtraLimits';
 import { ModelLedger } from './components/ModelLedger';
@@ -15,7 +16,7 @@ import { DEFAULT_PROVIDER, PROVIDERS, isProviderId, type ProviderCopy } from './
 import type { DashboardOverview, ProviderId, ProviderInfo } from './types';
 
 const SECTIONS: Section[] = ['overview', 'chats', 'models', 'cloud'];
-const PROVIDER_STORAGE_KEY = 'usage-dashboard.provider';
+const PROVIDER_STORAGE_KEY = 'ai-usage-tracker.provider';
 
 function initialProvider(): ProviderId {
   try {
@@ -44,7 +45,7 @@ function LoadingScreen({ copy }: { copy: ProviderCopy }) {
   return (
     <main className="loading-screen" aria-busy="true">
       <div className="loading-card">
-        <span className="wordmark-mark large" aria-hidden="true" />
+        <BrandLogo size="large" />
         <h1>{copy.loading.title}</h1>
         <p>{copy.loading.body}</p>
         <div className="loading-bars" aria-hidden="true"><span /><span /><span /></div>
@@ -228,7 +229,8 @@ export default function App() {
     return (
       <main className="loading-screen">
         <div className="loading-card">
-          <h1>The dashboard server is not answering</h1>
+          <BrandLogo size="large" />
+          <h1>The AI Usage Tracker server is not answering</h1>
           <p>{error}</p>
           <div className="loading-actions">
             <button className="button" type="button" onClick={() => void load(false)}>Try again</button>

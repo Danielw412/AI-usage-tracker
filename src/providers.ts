@@ -8,7 +8,7 @@ export interface ProviderCopy {
   id: ProviderId;
   /** Product name used in prose: "Codex", "Claude Code". */
   label: string;
-  /** Wordmark and browser title: "Codex usage", "Claude Code usage". */
+  /** Shared product wordmark and browser title. */
   appName: string;
   /** Short name for the CLI/app that reports quota: "Codex", "Claude". */
   reporter: string;
@@ -47,7 +47,7 @@ export const PROVIDERS: Record<ProviderId, ProviderCopy> = {
   codex: {
     id: 'codex',
     label: 'Codex',
-    appName: 'Codex usage',
+    appName: 'AI Usage Tracker',
     reporter: 'Codex',
     loading: {
       title: 'Reading your Codex activity',
@@ -76,7 +76,7 @@ export const PROVIDERS: Record<ProviderId, ProviderCopy> = {
   claude: {
     id: 'claude',
     label: 'Claude Code',
-    appName: 'Claude Code usage',
+    appName: 'AI Usage Tracker',
     reporter: 'Claude',
     loading: {
       title: 'Reading your Claude Code activity',

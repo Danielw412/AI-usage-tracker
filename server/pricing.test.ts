@@ -36,6 +36,22 @@ test('does not change Sol pricing when other model rates change', () => {
   assertCost('gpt-5.6-sol', '2026-07-31T00:00:00Z', 3.275);
 });
 
+test('prices GPT-6 Sol and Luna at their launch rates', () => {
+  assertCost('gpt-6-sol', '2026-09-22T12:00:00Z', 1.11);
+  assertCost('gpt-6-luna', '2026-09-22T12:00:00Z', 0.0555);
+
+  // Above 272K input tokens: $4 input and $15 output per million for Sol.
+  const longContext: TokenUsage = {
+    inputTokens: 300_000,
+    cachedInputTokens: 0,
+    outputTokens: 1_000_000,
+    reasoningOutputTokens: 0,
+    totalTokens: 1_300_000
+  };
+  const cost = estimateUsageCost('gpt-6-sol', longContext, unixTimestamp('2026-09-22T12:00:00Z'));
+  assert.ok(cost !== null && Math.abs(cost - 16.2) < 1e-12, `cost was ${cost}`);
+});
+
 test('prices Claude cache writes and reads separately from fresh input', () => {
   const usage: TokenUsage = {
     inputTokens: 11_100,
