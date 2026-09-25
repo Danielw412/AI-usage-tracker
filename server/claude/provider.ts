@@ -10,12 +10,20 @@ import {
   type ClaudeAccountInfo,
   type ClaudeUsageSnapshot
 } from './normalize.js';
-import { scanClaudeSessions } from './sessionLogs.js';
+import { claudeLegacyPartId, claudeSessionSource } from './sessionLogs.js';
 import { ClaudeUsageError, fetchClaudeUsage } from './usageApi.js';
 import { createUsageStore, type UsageStore } from '../db.js';
 import { buildProviderOverview } from '../overview.js';
-import { debugEnabled, type Provider } from '../providers.js';
+import {
+  SCAN_MARGIN_SECONDS,
+  debugEnabled,
+  standaloneRuntime,
+  type Provider,
+  type ProviderRuntime
+} from '../providers.js';
+import { createSessionScanner } from '../sessionScan.js';
 import type { AccountSummary, DashboardOverview, RateLimitWindow } from '../types.js';
+import { listWindows, windowDetail } from '../windows.js';
 
 export interface ClaudeProviderConfig {
   enabled: boolean;
@@ -23,6 +31,8 @@ export interface ClaudeProviderConfig {
   sessionScanMs: number;
   /** JSONL file the optional status-line hook appends samples to. */
   statuslineSampleFile?: string;
+  /** Role, device, and polling switches; single-machine defaults when omitted. */
+  runtime?: ProviderRuntime;
   store?: UsageStore;
 }
 
@@ -46,9 +56,30 @@ function minutes(ms: number): string {
  * is computed from what this machine logged.
  */
 export function createClaudeProvider(config: ClaudeProviderConfig): Provider {
-  const store = config.store ?? createUsageStore({ file: 'claude-usage.sqlite', provider: 'claude' });
+  const runtime = config.runtime ?? standaloneRuntime();
+  const store = config.store ?? createUsageStore({
+    file: 'claude-usage.sqlite',
+    provider: 'claude',
+    dataDir: runtime.dataDir,
+    deviceId: runtime.deviceId,
+    outbox: runtime.outbox,
+    legacyPartId: (row) => claudeLegacyPartId(row.sourceFile)
+  });
   const statuslineFile =
-    config.statuslineSampleFile ?? path.resolve(process.cwd(), 'data', 'claude-rate-limit-samples.jsonl');
+    config.statuslineSampleFile ?? path.join(runtime.dataDir, 'claude-rate-limit-samples.jsonl');
+  const scanner = createSessionScanner({
+    store,
+    source: claudeSessionSource(),
+    watch: runtime.watchSessions,
+    onScanned: (result, kind) => {
+      if (kind === 'full') void refreshLiveNames();
+      if (debugEnabled() && (kind === 'full' || result.updated > 0)) {
+        console.log(
+          `Claude ${kind} scan: ${result.scanned} files, ${result.incremental} resumed, ${result.full} parsed in full, ${result.errors} errors`
+        );
+      }
+    }
+  });
   let snapshot: ClaudeUsageSnapshot | null = null;
   let otherKeys: string[] = [];
   let account: ClaudeAccountInfo = { planType: null, organizationType: null, rateLimitTier: null, email: null };
@@ -58,7 +89,6 @@ export function createClaudeProvider(config: ClaudeProviderConfig): Provider {
   let backoffUntil = 0;
   let backoffMs = MIN_BACKOFF_MS;
   let usageRefreshInProgress: Promise<void> | null = null;
-  let sessionRefreshInProgress: Promise<void> | null = null;
   const timers: NodeJS.Timeout[] = [];
   let started = false;
 
@@ -98,7 +128,10 @@ export function createClaudeProvider(config: ClaudeProviderConfig): Provider {
     if (usageRefreshInProgress) return usageRefreshInProgress;
     usageRefreshInProgress = (async () => {
       const configJson = await readClaudeConfigJson();
+      // Samples Claude Code already wrote locally cost nothing to read, so
+      // collectors forward them too; only the endpoint poll is account-wide.
       await ingestLocalSamples(configJson);
+      if (!runtime.pollAccount) return;
 
       const credentials = await readClaudeCredentials();
       account = normalizeClaudeAccount(configJson, credentials?.subscriptionType ?? null);
@@ -148,37 +181,35 @@ export function createClaudeProvider(config: ClaudeProviderConfig): Provider {
     return usageRefreshInProgress;
   }
 
+  /** Running sessions may carry a name that never made it into the transcript. */
+  async function refreshLiveNames(): Promise<void> {
+    try {
+      const live = await readLiveClaudeSessions();
+      const named = new Set(
+        store.getThreadSummaries(1000)
+          .filter((thread) => thread.titleSource === 'generated')
+          .map((thread) => thread.threadId)
+      );
+      const inputs = live
+        .filter((session) => session.name && !named.has(session.sessionId))
+        .map((session) => ({
+          threadId: session.sessionId,
+          displayName: session.name,
+          preview: null,
+          updatedAt: Math.floor(Date.now() / 1000)
+        }));
+      if (inputs.length > 0) store.upsertThreadMetadata(inputs);
+    } catch (error) {
+      if (debugEnabled()) console.warn('Claude live session names unavailable:', (error as Error).message);
+    }
+  }
+
   async function refreshSessions(): Promise<void> {
-    if (sessionRefreshInProgress) return sessionRefreshInProgress;
-    sessionRefreshInProgress = (async () => {
-      try {
-        const result = await scanClaudeSessions(store);
-        // Running sessions may carry a name that never made it into the transcript.
-        const live = await readLiveClaudeSessions();
-        const named = new Set(
-          store.getThreadSummaries(1000)
-            .filter((thread) => thread.titleSource === 'generated')
-            .map((thread) => thread.threadId)
-        );
-        const inputs = live
-          .filter((session) => session.name && !named.has(session.sessionId))
-          .map((session) => ({
-            threadId: session.sessionId,
-            displayName: session.name,
-            preview: null,
-            updatedAt: Math.floor(Date.now() / 1000)
-          }));
-        if (inputs.length > 0) store.upsertThreadMetadata(inputs);
-        if (debugEnabled()) {
-          console.log(`Claude session scan: ${result.scanned} found, ${result.updated} updated, ${result.errors} errors`);
-        }
-      } catch (error) {
-        console.warn('Claude session scan failed:', (error as Error).message);
-      }
-    })().finally(() => {
-      sessionRefreshInProgress = null;
-    });
-    return sessionRefreshInProgress;
+    try {
+      await scanner.fullScan();
+    } catch (error) {
+      console.warn('Claude session scan failed:', (error as Error).message);
+    }
   }
 
   function currentWindow(key: string): RateLimitWindow | null {
@@ -223,16 +254,30 @@ export function createClaudeProvider(config: ClaudeProviderConfig): Provider {
       },
       account: accountSummary,
       cloudTasks: { status: 'unsupported', checkedAt: null, tasks: [] },
+      sync: runtime.sync('claude'),
       notices,
       emptyThreadsNotice:
         'No Claude Code transcripts were found. Check CLAUDE_CONFIG_DIR or start a Claude Code session, then refresh.'
     });
   }
 
+  function windowContext() {
+    return { settledThrough: runtime.sync('claude').settledThrough };
+  }
+
+  function currentFor(durationMins: number): RateLimitWindow | null {
+    return durationMins === 300 ? currentWindow(CLAUDE_FIVE_HOUR_KEY) : currentWindow(CLAUDE_SEVEN_DAY_KEY);
+  }
+
+  function keysFor(durationMins: number): string[] {
+    return durationMins === 300 ? HISTORY_KEYS.fiveHour : HISTORY_KEYS.sevenDay;
+  }
+
   return {
     id: 'claude',
     label: 'Claude Code',
     enabled: config.enabled,
+    store,
     start() {
       if (started || !config.enabled) return;
       started = true;
@@ -247,6 +292,7 @@ export function createClaudeProvider(config: ClaudeProviderConfig): Provider {
     stop() {
       for (const timer of timers) clearInterval(timer);
       timers.length = 0;
+      scanner.stop();
     },
     async refresh() {
       if (!config.enabled) return;
@@ -255,6 +301,17 @@ export function createClaudeProvider(config: ClaudeProviderConfig): Provider {
     overview,
     health() {
       return { connected, error: connectionError };
-    }
+    },
+    windows(durationMins) {
+      return listWindows(store, durationMins, keysFor(durationMins), currentFor(durationMins), windowContext());
+    },
+    windowDetail(durationMins, resetsAt) {
+      return windowDetail(store, durationMins, keysFor(durationMins), resetsAt, currentFor(durationMins), windowContext());
+    },
+    scannedThrough() {
+      const startedAt = scanner.lastFullScanStartedAt();
+      return startedAt === null ? null : startedAt - SCAN_MARGIN_SECONDS;
+    },
+    watching: () => scanner.watching()
   };
 }

@@ -2,12 +2,17 @@ import {
   buildChartPoints,
   calculateModelEfficiency,
   calculateProjection,
-  calculateThreadUsageEstimates,
-  calculateWindowBreakdown,
   type HistoryKeys
 } from './analytics.js';
 import type { UsageStore } from './db.js';
-import type { AccountSummary, DashboardOverview, ProviderId, RateLimitWindow } from './types.js';
+import type {
+  AccountSummary,
+  DashboardOverview,
+  ProviderId,
+  RateLimitWindow,
+  SyncOverview
+} from './types.js';
+import { calculateThreadUsageEstimates, calculateWindowBreakdown } from './windows.js';
 
 export interface CurrentLimits {
   fiveHour: RateLimitWindow | null;
@@ -24,6 +29,7 @@ export interface OverviewInputs {
   connection: DashboardOverview['connection'];
   account: AccountSummary;
   cloudTasks: DashboardOverview['cloudTasks'];
+  sync: SyncOverview;
   notices: string[];
   /** Notice shown when the store holds no session data at all. */
   emptyThreadsNotice: string;
@@ -32,11 +38,14 @@ export interface OverviewInputs {
 /**
  * Assemble the dashboard payload from a provider's store and live state. Every
  * provider shares this so the projections, attribution, and charts behave the
- * same way regardless of where the samples and logs came from.
+ * same way regardless of where the samples and logs came from. On the central
+ * server the store holds every device's events, so every figure below is the
+ * combined picture.
  */
 export function buildProviderOverview(inputs: OverviewInputs): DashboardOverview {
   const { store, limits, historyKeys = {} } = inputs;
   const { fiveHour, sevenDay } = limits;
+  const context = { settledThrough: inputs.sync.settledThrough };
   const fiveHistory = fiveHour
     ? store.getRateLimitHistory(300, fiveHour.resetsAt, 2, historyKeys.fiveHour)
     : store.getRateLimitHistory(300, undefined, 8, historyKeys.fiveHour);
@@ -74,12 +83,8 @@ export function buildProviderOverview(inputs: OverviewInputs): DashboardOverview
       sevenDay: buildChartPoints(sevenDay, sevenHistory, sevenProjection)
     },
     breakdown: {
-      fiveHour: calculateWindowBreakdown(
-        store, fiveHour, store.getRateLimitHistory(300, undefined, 2, historyKeys.fiveHour)
-      ),
-      sevenDay: calculateWindowBreakdown(
-        store, sevenDay, store.getRateLimitHistory(10_080, undefined, 9, historyKeys.sevenDay)
-      )
+      fiveHour: calculateWindowBreakdown(store, fiveHour, 2, historyKeys.fiveHour, context),
+      sevenDay: calculateWindowBreakdown(store, sevenDay, 9, historyKeys.sevenDay, context)
     },
     accountDailyUsage: store.getAccountDailyUsage(14),
     localDailyUsage: store.getLocalDailyUsage(14),
@@ -89,6 +94,7 @@ export function buildProviderOverview(inputs: OverviewInputs): DashboardOverview
     modelEfficiency: calculateModelEfficiency(store, historyKeys),
     modelUsage: store.getModelUsageSummaries(),
     cloudTasks: inputs.cloudTasks,
+    sync: inputs.sync,
     notices
   };
 }

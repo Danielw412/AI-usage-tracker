@@ -207,9 +207,11 @@ interface ThreadsTableProps {
   selectedThreadId: string | null;
   copy: ProviderCopy;
   now: number;
+  /** Device id to label, when more than one device reports usage. */
+  deviceLabels: Map<string, string> | null;
 }
 
-export function ThreadsTable({ threads, colors, selectedThreadId, copy, now }: ThreadsTableProps) {
+export function ThreadsTable({ threads, colors, selectedThreadId, copy, now, deviceLabels }: ThreadsTableProps) {
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
   const [query, setQuery] = useState('');
   const [filter, setFilter] = useState<ThreadFilter>('all');
@@ -250,7 +252,8 @@ export function ThreadsTable({ threads, colors, selectedThreadId, copy, now }: T
         thread.primaryModel,
         thread.sourceLabel ?? '',
         thread.reasoningEffort ?? '',
-        thread.gitBranch ?? ''
+        thread.gitBranch ?? '',
+        ...(deviceLabels ? (thread.deviceIds ?? []).map((id) => deviceLabels.get(id) ?? id) : [])
       ].some((value) => value.toLowerCase().includes(normalized));
     });
     return [...filtered].sort((a, b) => {
@@ -260,7 +263,7 @@ export function ThreadsTable({ threads, colors, selectedThreadId, copy, now }: T
       if (sort === 'cost') return (b.estimatedApiCostUsd ?? -1) - (a.estimatedApiCostUsd ?? -1);
       return (b.updatedAt ?? b.startedAt ?? 0) - (a.updatedAt ?? a.startedAt ?? 0);
     });
-  }, [filter, query, sort, threads]);
+  }, [filter, query, sort, threads, deviceLabels]);
 
   const toggle = (threadId: string) => {
     setExpanded((current) => {
@@ -276,7 +279,11 @@ export function ThreadsTable({ threads, colors, selectedThreadId, copy, now }: T
       <header className="section-head with-tools">
         <div>
           <h2 id="chats-title">Chats</h2>
-          <p>Every chat found in your local logs, with its share of each limit.</p>
+          <p>
+            {deviceLabels
+              ? 'Every chat from every device, with its share of each limit.'
+              : 'Every chat found in your local logs, with its share of each limit.'}
+          </p>
         </div>
         <div className="toolbar">
           <label className="search-field">
@@ -358,6 +365,11 @@ export function ThreadsTable({ threads, colors, selectedThreadId, copy, now }: T
                       <span className="thread-title-text" title={thread.title}>{thread.title}</span>
                     </span>
                     <span className="thread-meta">
+                      {deviceLabels
+                        ? (thread.deviceIds ?? []).map((deviceId) => (
+                            <span key={deviceId} className="device-tag">{deviceLabels.get(deviceId) ?? deviceId}</span>
+                          ))
+                        : null}
                       <span className={`source-tag ${thread.source}`}>{SOURCE_LABELS[thread.source] ?? 'Local'}</span>
                       {thread.sourceLabel && thread.source !== 'exec' ? <span>{thread.sourceLabel}</span> : null}
                       {project ? <span>{project}</span> : null}

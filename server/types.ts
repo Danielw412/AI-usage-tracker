@@ -97,6 +97,12 @@ export interface PromptMetric extends TokenUsage {
 
 export interface ThreadPartSummary extends TokenUsage {
   threadId: string;
+  /**
+   * Stable, path-independent identity of the part: the Codex rollout file name,
+   * or the transcript path under Claude's projects folder. Defaults to
+   * `sourceFile` for callers that predate multi-device tracking.
+   */
+  partId?: string;
   title: string | null;
   projectPath: string | null;
   startedAt: number | null;
@@ -105,6 +111,7 @@ export interface ThreadPartSummary extends TokenUsage {
   models: string[];
   estimatedApiCostUsd: number | null;
   pricingStatus: PricingStatus;
+  /** Path of the log on the device that produced it. */
   sourceFile: string;
   partKind: SessionPartKind;
   userMessageCount: number;
@@ -153,6 +160,8 @@ export interface ThreadSummary extends TokenUsage {
   partCount: number;
   /** Cost the provider itself recorded for the chat, when available (Claude Code writes one). */
   reportedCostUsd: number | null;
+  /** Devices whose logs contributed to this chat, normally exactly one. */
+  deviceIds: string[];
   prompts: PromptMetric[];
   usage: {
     fiveHour: ThreadWindowUsage | null;
@@ -191,6 +200,9 @@ export interface WindowThreadShare {
   model: string;
   percent: number;
   coverage: number;
+  /** Portion of `percent` earned in quota rises shared with other chats. */
+  sharedPercent: number;
+  deviceIds: string[];
 }
 
 /** Where the current reset bank's usage came from. */
@@ -204,6 +216,100 @@ export interface WindowBreakdown {
   threads: WindowThreadShare[];
   activity: WindowActivityRun[];
   cloudTasksInWindow: number;
+  /** True while a collector has not yet synchronized past the end of this bank. */
+  provisional: boolean;
+}
+
+/** One chat's contribution to a single quota window (current or past). */
+export interface WindowSession {
+  threadId: string;
+  title: string;
+  model: string;
+  source: ThreadSource;
+  sourceLabel: string | null;
+  projectName: string | null;
+  deviceIds: string[];
+  percent: number;
+  sharedPercent: number;
+  coverage: number;
+  spans: number;
+  /** Tokens and API-equivalent cost logged inside this window only. */
+  tokens: number;
+  costUsd: number;
+  events: number;
+  firstEventAt: number | null;
+  lastEventAt: number | null;
+}
+
+/** One entry in the list of past and current quota windows. */
+export interface WindowSummary {
+  durationMins: number;
+  resetsAt: number;
+  windowStartsAt: number;
+  /** min(resetsAt, now): where the observed part of the window ends. */
+  endsAt: number;
+  current: boolean;
+  provisional: boolean;
+  /** Highest reported value in the window. */
+  peakPercent: number;
+  /** Last reported value in the window. */
+  finalPercent: number;
+  samples: number;
+  observedDeltaPercent: number;
+  attributedPercent: number;
+  unattributedPercent: number;
+  /** Chats with events or attributed usage in the window. */
+  sessionCount: number;
+  tokens: number;
+  costUsd: number;
+}
+
+export interface WindowDeviceShare {
+  deviceId: string;
+  percent: number;
+  tokens: number;
+  costUsd: number;
+}
+
+/** Everything the dashboard shows for one selected quota window. */
+export interface WindowDetail extends WindowSummary {
+  /** Attributed share of the observed rise, 0..1. */
+  coverage: number;
+  points: ProjectionPoint[];
+  sessions: WindowSession[];
+  activity: WindowActivityRun[];
+  devices: WindowDeviceShare[];
+}
+
+export type TrackerRole = 'standalone' | 'server' | 'collector';
+
+/** What the central server knows about one device that reports usage. */
+export interface DeviceStatus {
+  deviceId: string;
+  label: string;
+  role: TrackerRole;
+  /** True for the machine serving this dashboard. */
+  self: boolean;
+  online: boolean;
+  lastSeenAt: number | null;
+  lastSyncAt: number | null;
+  /** Records waiting in the device's outbox at its last report. */
+  pendingRecords: number | null;
+  /** Everything this device logged up to here has reached the server. */
+  syncedThrough: number | null;
+  /** Server clock minus device clock, seconds, at the last contact. */
+  clockOffsetSeconds: number | null;
+  warning: string | null;
+}
+
+export interface SyncOverview {
+  role: TrackerRole;
+  deviceId: string;
+  devices: DeviceStatus[];
+  /** Attribution before this time has every known device's events. */
+  settledThrough: number | null;
+  /** True once more than one device has reported usage. */
+  multiDevice: boolean;
 }
 
 export interface CloudTask {
@@ -291,5 +397,6 @@ export interface DashboardOverview {
     checkedAt: number | null;
     tasks: CloudTask[];
   };
+  sync: SyncOverview;
   notices: string[];
 }

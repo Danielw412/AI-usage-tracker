@@ -1,5 +1,8 @@
 import type {
   DashboardOverview,
+  SyncOverview,
+  WindowDetail,
+  WindowSummary,
   ProjectionPoint,
   PromptMetric,
   ProviderId,
@@ -7,6 +10,8 @@ import type {
 } from './types.js';
 
 const now = Math.floor(Date.now() / 1000);
+const DEMO_SERVER = 'home-server';
+const DEMO_LAPTOP = 'laptop';
 
 /** Provider-flavoured names so the demo reads like real data for either CLI. */
 interface DemoFlavour {
@@ -141,6 +146,7 @@ function buildThreads(flavour: DemoFlavour): ThreadSummary[] {
       subagentTokens: flavour.cacheWrites ? 148_000 : 0,
       partCount: 3,
       reportedCostUsd: flavour.reportedCost ? 3.91 : null,
+      deviceIds: [DEMO_SERVER],
       prompts: threadOnePrompts,
       usage: {
         fiveHour: { percent: 9.8, coverage: 0.94, sharedPercent: 2.1, spans: 12, windowResetsAt: now + 5400, current: true },
@@ -178,6 +184,7 @@ function buildThreads(flavour: DemoFlavour): ThreadSummary[] {
       subagentTokens: 0,
       partCount: 1,
       reportedCostUsd: flavour.reportedCost ? 1.05 : null,
+      deviceIds: [DEMO_LAPTOP],
       prompts: threadTwoPrompts,
       usage: {
         fiveHour: { percent: 6.2, coverage: 1, sharedPercent: 0, spans: 6, windowResetsAt: now - 80_000, current: false },
@@ -270,15 +277,16 @@ export function demoOverview(provider: ProviderId = 'codex'): DashboardOverview 
         unattributedPercent: 6,
         samples: 210,
         threads: [
-          { threadId: 'demo-1', title: 'Schedule import authentication', model: flavour.primaryModel, percent: 32.4, coverage: 0.94 },
-          { threadId: 'demo-2', title: 'Cleaner mobile schedule grid', model: flavour.secondaryModel, percent: 8.6, coverage: 1 }
+          { threadId: 'demo-1', title: 'Schedule import authentication', model: flavour.primaryModel, percent: 32.4, coverage: 0.94, sharedPercent: 3.1, deviceIds: [DEMO_SERVER] },
+          { threadId: 'demo-2', title: 'Cleaner mobile schedule grid', model: flavour.secondaryModel, percent: 8.6, coverage: 1, sharedPercent: 3.1, deviceIds: [DEMO_LAPTOP] }
         ],
         activity: [
           { threadId: 'demo-1', startedAt: now - 7200, completedAt: now - 6040 },
           { threadId: 'demo-1', startedAt: now - 5100, completedAt: now - 4460 },
           { threadId: 'demo-2', startedAt: now - 6500, completedAt: now - 5900 }
         ],
-        cloudTasksInWindow: isClaude ? 0 : 1
+        cloudTasksInWindow: isClaude ? 0 : 1,
+        provisional: false
       },
       sevenDay: {
         resetsAt: now + 86400,
@@ -288,11 +296,12 @@ export function demoOverview(provider: ProviderId = 'codex'): DashboardOverview 
         unattributedPercent: 3,
         samples: 900,
         threads: [
-          { threadId: 'demo-1', title: 'Schedule import authentication', model: flavour.primaryModel, percent: 21.2, coverage: 0.94 },
-          { threadId: 'demo-2', title: 'Cleaner mobile schedule grid', model: flavour.secondaryModel, percent: 17.8, coverage: 1 }
+          { threadId: 'demo-1', title: 'Schedule import authentication', model: flavour.primaryModel, percent: 21.2, coverage: 0.94, sharedPercent: 0, deviceIds: [DEMO_SERVER] },
+          { threadId: 'demo-2', title: 'Cleaner mobile schedule grid', model: flavour.secondaryModel, percent: 17.8, coverage: 1, sharedPercent: 0, deviceIds: [DEMO_LAPTOP] }
         ],
         activity: [],
-        cloudTasksInWindow: isClaude ? 0 : 2
+        cloudTasksInWindow: isClaude ? 0 : 2,
+        provisional: false
       }
     },
     accountDailyUsage: isClaude
@@ -425,6 +434,141 @@ export function demoOverview(provider: ProviderId = 'codex'): DashboardOverview 
             }
           ]
         },
+    sync: demoDevices(),
     notices: [flavour.notice]
+  };
+}
+
+/** Two devices: the central server and a laptop that is behind on syncing. */
+export function demoDevices(): SyncOverview {
+  return {
+    role: 'server',
+    deviceId: DEMO_SERVER,
+    devices: [
+      {
+        deviceId: DEMO_SERVER,
+        label: 'Home server',
+        role: 'server',
+        self: true,
+        online: true,
+        lastSeenAt: now,
+        lastSyncAt: null,
+        pendingRecords: null,
+        syncedThrough: now - 90,
+        clockOffsetSeconds: 0,
+        warning: null
+      },
+      {
+        deviceId: DEMO_LAPTOP,
+        label: 'Laptop',
+        role: 'collector',
+        self: false,
+        online: false,
+        lastSeenAt: now - 2 * 3600,
+        lastSyncAt: now - 2 * 3600,
+        pendingRecords: 0,
+        syncedThrough: now - 2 * 3600 - 60,
+        clockOffsetSeconds: 1,
+        warning: null
+      }
+    ],
+    settledThrough: now - 2 * 3600 - 60,
+    multiDevice: true
+  };
+}
+
+function demoWindowList(durationMins: number): WindowSummary[] {
+  const span = durationMins * 60;
+  const currentReset = durationMins === 300 ? now + 5400 : now + 86400;
+  const finals = durationMins === 300 ? [47, 64, 22, 88, 35] : [42, 71, 58];
+  return finals.map((finalPercent, index) => {
+    const resetsAt = currentReset - index * span;
+    const current = index === 0;
+    const attributed = finalPercent * (current ? 0.87 : 0.93);
+    return {
+      durationMins,
+      resetsAt,
+      windowStartsAt: resetsAt - span,
+      endsAt: Math.min(resetsAt, now),
+      current,
+      provisional: current || index === 1,
+      peakPercent: finalPercent,
+      finalPercent,
+      samples: current ? 210 : 300,
+      observedDeltaPercent: finalPercent,
+      attributedPercent: attributed,
+      unattributedPercent: finalPercent - attributed,
+      sessionCount: 2,
+      tokens: 1_200_000 + index * 310_000,
+      costUsd: 2.4 + index * 0.7
+    };
+  });
+}
+
+export function demoWindows(durationMins: number): WindowSummary[] {
+  return demoWindowList(durationMins);
+}
+
+export function demoWindowDetail(durationMins: number, resetsAt: number): WindowDetail | null {
+  const summary = demoWindowList(durationMins).find((window) => Math.abs(window.resetsAt - resetsAt) <= 180);
+  if (!summary) return null;
+  const span = summary.endsAt - summary.windowStartsAt;
+  const steps = 16;
+  const points = Array.from({ length: steps }, (_, index) => ({
+    timestamp: summary.windowStartsAt + Math.round((span * index) / (steps - 1)),
+    usedPercent: Math.round((summary.finalPercent * index) / (steps - 1))
+  }));
+  const serverShare = summary.attributedPercent * 0.62;
+  const laptopShare = summary.attributedPercent - serverShare;
+  return {
+    ...summary,
+    coverage: summary.observedDeltaPercent > 0 ? summary.attributedPercent / summary.observedDeltaPercent : 0,
+    points,
+    sessions: [
+      {
+        threadId: 'demo-1',
+        title: 'Schedule import authentication',
+        model: 'gpt-5.6-sol',
+        source: 'desktop',
+        sourceLabel: null,
+        projectName: 'ScheduleShare',
+        deviceIds: [DEMO_SERVER],
+        percent: serverShare,
+        sharedPercent: serverShare * 0.2,
+        coverage: 0.94,
+        spans: 11,
+        tokens: Math.round(summary.tokens * 0.6),
+        costUsd: summary.costUsd * 0.6,
+        events: 140,
+        firstEventAt: summary.windowStartsAt + 600,
+        lastEventAt: summary.endsAt - 900
+      },
+      {
+        threadId: 'demo-2',
+        title: 'Cleaner mobile schedule grid',
+        model: 'gpt-5.6-terra',
+        source: 'cli',
+        sourceLabel: null,
+        projectName: 'ScheduleShare',
+        deviceIds: [DEMO_LAPTOP],
+        percent: laptopShare,
+        sharedPercent: laptopShare * 0.3,
+        coverage: 1,
+        spans: 7,
+        tokens: Math.round(summary.tokens * 0.4),
+        costUsd: summary.costUsd * 0.4,
+        events: 88,
+        firstEventAt: summary.windowStartsAt + 1800,
+        lastEventAt: summary.endsAt - 2400
+      }
+    ],
+    activity: [
+      { threadId: 'demo-1', startedAt: summary.windowStartsAt + 600, completedAt: summary.windowStartsAt + 3600 },
+      { threadId: 'demo-2', startedAt: summary.windowStartsAt + 1800, completedAt: summary.windowStartsAt + 4200 }
+    ],
+    devices: [
+      { deviceId: DEMO_SERVER, percent: serverShare, tokens: Math.round(summary.tokens * 0.6), costUsd: summary.costUsd * 0.6 },
+      { deviceId: DEMO_LAPTOP, percent: laptopShare, tokens: Math.round(summary.tokens * 0.4), costUsd: summary.costUsd * 0.4 }
+    ]
   };
 }

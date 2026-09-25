@@ -8,8 +8,9 @@ import { ModelLedger } from './components/ModelLedger';
 import { StatStrip } from './components/StatStrip';
 import { ThreadsTable } from './components/ThreadsTable';
 import { Topbar, type Section } from './components/Topbar';
-import { UsageChart, type UsageRange } from './components/UsageChart';
+import type { UsageRange } from './components/UsageChart';
 import { WindowCard } from './components/WindowCard';
+import { WindowExplorer } from './components/WindowExplorer';
 import { percent } from './format';
 import { assignSeriesColors } from './palette';
 import { DEFAULT_PROVIDER, PROVIDERS, isProviderId, type ProviderCopy } from './providers';
@@ -51,24 +52,6 @@ function LoadingScreen({ copy }: { copy: ProviderCopy }) {
         <div className="loading-bars" aria-hidden="true"><span /><span /><span /></div>
       </div>
     </main>
-  );
-}
-
-function WindowToggle({ value, onChange }: { value: UsageRange; onChange: (value: UsageRange) => void }) {
-  return (
-    <div className="segmented" role="group" aria-label="Usage window">
-      {([['five', '5 hours'], ['seven', '7 days']] as const).map(([key, label]) => (
-        <button
-          key={key}
-          type="button"
-          className={value === key ? 'active' : ''}
-          aria-pressed={value === key}
-          onClick={() => onChange(key)}
-        >
-          {label}
-        </button>
-      ))}
-    </div>
   );
 }
 
@@ -223,6 +206,24 @@ export default function App() {
     return overview.accountDailyUsage.length > 0 ? overview.accountDailyUsage : overview.localDailyUsage;
   }, [overview]);
 
+  // Device names only appear once more than one machine reports usage.
+  const deviceLabels = useMemo(() => {
+    if (!overview?.sync?.multiDevice) return null;
+    return new Map(overview.sync.devices.map((device) => [device.deviceId, device.label]));
+  }, [overview]);
+
+  // The live window always ends "now"; only call it provisional when a device
+  // is actually behind, not for the minute or two every scan takes.
+  const provisionalNote = useMemo(() => {
+    const sync = overview?.sync;
+    if (!sync?.multiDevice) return null;
+    if (sync.settledThrough !== null && overview!.generatedAt - sync.settledThrough <= 600) return null;
+    const behind = sync.devices
+      .filter((device) => !device.self && (device.syncedThrough === null || device.syncedThrough === sync.settledThrough))
+      .map((device) => device.label);
+    return behind.length > 0 ? `Waiting for ${behind.join(', ')} to sync` : 'Waiting for a device to sync';
+  }, [overview]);
+
   if (!overview && !error) return <LoadingScreen copy={copy} />;
 
   if (!overview) {
@@ -230,7 +231,11 @@ export default function App() {
       <main className="loading-screen">
         <div className="loading-card">
           <BrandLogo size="large" />
-          <h1>The AI Usage Tracker server is not answering</h1>
+          <h1>
+            {/runs as a collector/.test(error ?? '')
+              ? 'This machine sends its usage to another dashboard'
+              : 'The AI Usage Tracker server is not answering'}
+          </h1>
           <p>{error}</p>
           <div className="loading-actions">
             <button className="button" type="button" onClick={() => void load(false)}>Try again</button>
@@ -244,10 +249,6 @@ export default function App() {
       </main>
     );
   }
-
-  const selectedLimit = range === 'five' ? overview.limits.fiveHour : overview.limits.sevenDay;
-  const selectedPoints = range === 'five' ? overview.histories.fiveHour : overview.histories.sevenDay;
-  const selectedBreakdown = range === 'five' ? overview.breakdown.fiveHour : overview.breakdown.sevenDay;
 
   return (
     <div className="app" data-provider={provider}>
@@ -264,6 +265,8 @@ export default function App() {
         updatedAt={overview.generatedAt}
         refreshing={refreshing}
         onRefresh={() => void load(true)}
+        sync={overview.sync}
+        now={now}
       />
 
       <main className="page">
@@ -287,6 +290,7 @@ export default function App() {
               primary
               now={now}
               onSelectThread={selectThread}
+              provisionalNote={provisionalNote}
             />
             <WindowCard
               title="7-day window"
@@ -298,29 +302,24 @@ export default function App() {
               copy={copy}
               now={now}
               onSelectThread={selectThread}
+              provisionalNote={provisionalNote}
             />
           </div>
 
           <ExtraLimits windows={overview.limits.other} now={now} />
 
-          <div className="panel usage-panel">
-            <header className="panel-head">
-              <div>
-                <h3>Usage over the window</h3>
-                <p>Reported percentage, the projected path to reset, and when each chat was running.</p>
-              </div>
-              <WindowToggle value={range} onChange={setRange} />
-            </header>
-            <UsageChart
-              points={selectedPoints}
-              range={range}
-              resetAt={selectedLimit?.resetsAt ?? null}
-              breakdown={selectedBreakdown}
-              colors={colors}
-              titles={titles}
-              now={now}
-            />
-          </div>
+          <WindowExplorer
+            provider={provider}
+            overview={overview}
+            range={range}
+            onRangeChange={setRange}
+            colors={colors}
+            titles={titles}
+            deviceLabels={deviceLabels}
+            provisionalNote={provisionalNote}
+            now={now}
+            onSelectThread={selectThread}
+          />
 
           <StatStrip overview={overview} copy={copy} />
         </section>
@@ -331,6 +330,7 @@ export default function App() {
           selectedThreadId={selectedThread}
           copy={copy}
           now={now}
+          deviceLabels={deviceLabels}
         />
 
         <section className="section" id="models" aria-labelledby="models-title">

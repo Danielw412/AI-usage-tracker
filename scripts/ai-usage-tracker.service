@@ -1,0 +1,35 @@
+# systemd user service for AI Usage Tracker on Linux (server or collector).
+#
+# Install (as the user whose ~/.codex and ~/.claude should be read):
+#   mkdir -p ~/.config/systemd/user
+#   cp scripts/ai-usage-tracker.service ~/.config/systemd/user/
+#   # Edit WorkingDirectory below if the checkout is not ~/ai-usage-tracker.
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now ai-usage-tracker
+#   loginctl enable-linger "$USER"   # keep it running while you are logged out
+#
+# Logs:     journalctl --user -u ai-usage-tracker -f
+# Restart:  systemctl --user restart ai-usage-tracker   (after `npm run build`)
+#
+# Settings come from .env in the working directory. systemd starts services with
+# a short PATH, so set CODEX_BIN to the absolute path of `codex` (`which codex`),
+# and if Node came from nvm or similar, replace `/usr/bin/env node` below with
+# the absolute path from `which node`.
+
+[Unit]
+Description=AI Usage Tracker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/ai-usage-tracker
+ExecStart=/usr/bin/env node dist-server/index.js
+Restart=on-failure
+RestartSec=10
+# Stop cleanly: the tracker commits every write before it acknowledges anything.
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+[Install]
+WantedBy=default.target

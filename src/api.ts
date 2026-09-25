@@ -1,4 +1,4 @@
-import type { DashboardOverview, ProviderId, ProviderInfo } from './types';
+import type { DashboardOverview, ProviderId, ProviderInfo, WindowDetail, WindowSummary } from './types';
 
 export interface ProvidersResponse {
   providers: ProviderInfo[];
@@ -37,4 +37,16 @@ export function getOverview(provider: ProviderId): Promise<DashboardOverview> {
 
 export function refreshOverview(provider: ProviderId): Promise<DashboardOverview> {
   return request(`/api/refresh${providerQuery(provider)}`, { method: 'POST' });
+}
+
+/** Current and past quota windows of one length, newest first. */
+export async function getWindows(provider: ProviderId, durationMins: number): Promise<WindowSummary[]> {
+  const result = await request<{ windows: WindowSummary[] }>(
+    `/api/windows${providerQuery(provider)}&duration=${durationMins}`
+  );
+  return result.windows;
+}
+
+export function getWindowDetail(provider: ProviderId, durationMins: number, resetsAt: number): Promise<WindowDetail> {
+  return request(`/api/windows/detail${providerQuery(provider)}&duration=${durationMins}&resetsAt=${resetsAt}`);
 }

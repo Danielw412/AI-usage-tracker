@@ -1,8 +1,9 @@
 import { RefreshCw } from 'lucide-react';
 import { BrandLogo } from './BrandLogo';
+import { DeviceStatusMenu } from './DeviceStatus';
 import { clock, sentence } from '../format';
 import type { ProviderCopy } from '../providers';
-import type { ProviderId, ProviderInfo } from '../types';
+import type { ProviderId, ProviderInfo, SyncOverview } from '../types';
 
 export type Section = 'overview' | 'chats' | 'models' | 'cloud';
 
@@ -25,6 +26,8 @@ interface TopbarProps {
   updatedAt: number;
   refreshing: boolean;
   onRefresh: () => void;
+  sync: SyncOverview | undefined;
+  now: number;
 }
 
 export function Topbar({
@@ -38,7 +41,9 @@ export function Topbar({
   planType,
   updatedAt,
   refreshing,
-  onRefresh
+  onRefresh,
+  sync,
+  now
 }: TopbarProps) {
   return (
     <header className="topbar">
@@ -80,6 +85,7 @@ export function Topbar({
         </nav>
 
         <div className="topbar-status">
+          {sync ? <DeviceStatusMenu sync={sync} now={now} /> : null}
           <span className={`status-pill ${connected ? 'online' : 'offline'}`}>
             <i aria-hidden="true" />
             {connected ? (planType ? `${sentence(planType)} plan` : 'Connected') : copy.offline}

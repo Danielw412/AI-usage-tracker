@@ -2,6 +2,17 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { cleanDisplayText } from './messageText.js';
+import { estimateUsageCost } from './pricing.js';
+import { ensureSchema, type LegacyPartRow } from './schema.js';
+import {
+  sampleRecordKey,
+  type ParsedSyncRecord,
+  type SyncEventData,
+  type SyncPartData,
+  type SyncPromptData,
+  type SyncRecord,
+  type SyncRecordKind
+} from './sync/protocol.js';
 import type {
   AccountSummary,
   CloudTask,
@@ -25,6 +36,8 @@ import type {
  */
 const METADATA_VERSION = '3';
 const AUTO_REVIEW_MODEL = 'codex-auto-review';
+/** Device id used when a caller does not configure one (tests, older callers). */
+export const DEFAULT_DEVICE_ID = 'local';
 
 export interface StoredThreadEvent extends TokenUsage {
   eventKey: string;
@@ -55,6 +68,8 @@ export interface TokenEventRow {
   threadId: string;
   model: string;
   partKind: SessionPartKind;
+  /** Device that logged the event. */
+  deviceId?: string;
   totalTokens: number;
   estimatedApiCostUsd: number | null;
 }
@@ -79,15 +94,91 @@ export type LocalAccountStats = Pick<
   'lifetimeTokens' | 'peakDailyTokens' | 'longestRunningTurnSec' | 'currentStreakDays' | 'longestStreakDays'
 >;
 
+/** One session part as a parser produced it. */
+export interface IndexedPart {
+  summary: ThreadPartSummary;
+  events: StoredThreadEvent[];
+  prompts: PromptMetric[];
+  /** Quota samples embedded in the log, if the provider writes any. */
+  limits?: RateLimitWindow[];
+}
+
+export type LocalFileStatus = 'indexed' | 'superseded' | 'empty';
+
+/** Where one local log file was indexed up to. */
+export interface LocalFileRecord {
+  path: string;
+  partIds: string[];
+  modifiedMs: number;
+  sizeBytes: number;
+  parserVersion: string;
+  status: LocalFileStatus;
+  /** Byte offset just past the last newline the saved parser state covers. */
+  tailOffset: number | null;
+  /** Serialized parser state at `tailOffset`, for incremental parsing. */
+  tailState: string | null;
+  headLength: number | null;
+  headHash: string | null;
+  anchorHash: string | null;
+  /** Another file whose changes require this one to be parsed again. */
+  dependsOn: string | null;
+  dependsStat: string | null;
+  indexedAt: number;
+}
+
+export interface FileIndexUpdate {
+  /**
+   * `full` replaces everything the file produced before; `incremental` only adds
+   * and updates rows produced by newly appended lines.
+   */
+  mode: 'full' | 'incremental';
+  /** `null`: nothing indexable, leave stored rows alone. `[]`: superseded, remove them. */
+  parts: IndexedPart[] | null;
+  /** Part ids the file could have produced before it was tracked here (migrated rows). */
+  candidatePartIds?: string[];
+  metadata?: ThreadMetadataInput[];
+  file: Omit<LocalFileRecord, 'path' | 'partIds' | 'indexedAt'>;
+}
+
+export interface OutboxStats {
+  pending: number;
+  /** Log timestamp of the oldest event or quota sample still waiting. */
+  oldestPendingAt: number | null;
+  oldestCreatedAt: number | null;
+}
+
+export interface ThreadLookupEntry {
+  title: string;
+  model: string;
+  source: ThreadSource;
+  sourceLabel: string | null;
+  projectName: string | null;
+  deviceIds: string[];
+}
+
+export interface CachedAttribution {
+  signature: string;
+  resultJson: string;
+  computedAt: number;
+}
+
 export interface UsageStoreOptions {
   /** SQLite file name inside the data directory, or an absolute path. */
   file: string;
   provider: ProviderId;
   /** Directory holding the database. Defaults to ./data. */
   dataDir?: string;
+  /** Device id stamped on everything this machine indexes. */
+  deviceId?: string;
+  /** Record every local change in the sync outbox (collector role). */
+  outbox?: boolean;
+  /** Stable part id for a row written by a pre-multi-device build. */
+  legacyPartId?: (row: LegacyPartRow) => string;
 }
 
-interface PartRow extends TokenUsage {
+interface PartRow {
+  partId: string;
+  deviceId: string;
   sourceFile: string;
   threadId: string;
   partKind: SessionPartKind;
@@ -96,17 +187,26 @@ interface PartRow extends TokenUsage {
   startedAt: number | null;
   updatedAt: number | null;
   primaryModel: string;
-  modelsJson: string;
-  estimatedApiCostUsd: number | null;
-  pricingStatus: PricingStatus;
   userMessageCount: number;
   source: ThreadSource | null;
   sourceLabel: string | null;
   reportedCostUsd: number | null;
 }
 
-interface ModelTokenRow {
+interface PartTotalsRow extends TokenUsage {
+  partId: string;
   threadId: string;
+  partKind: SessionPartKind;
+  deviceId: string;
+  estimatedApiCostUsd: number | null;
+  pricedEvents: number;
+  unpricedEvents: number;
+  firstEventAt: number | null;
+  lastEventAt: number | null;
+}
+
+interface PartModelRow {
+  partId: string;
   model: string;
   totalTokens: number;
 }
@@ -115,6 +215,7 @@ interface MetadataRow {
   threadId: string;
   displayName: string | null;
   preview: string | null;
+  updatedAt: number;
   source: ThreadSource | null;
   sourceLabel: string | null;
   model: string | null;
@@ -126,6 +227,8 @@ interface MetadataRow {
 
 interface PromptRow extends TokenUsage {
   promptId: string;
+  partId: string;
+  deviceId: string;
   sourceFile: string;
   threadId: string;
   turnId: string | null;
@@ -140,6 +243,17 @@ interface PromptRow extends TokenUsage {
   modelsJson: string;
   estimatedApiCostUsd: number | null;
   pricingStatus: PricingStatus;
+}
+
+interface EventRow extends TokenUsage {
+  eventKey: string;
+  partId: string;
+  deviceId: string;
+  threadId: string;
+  partKind: SessionPartKind;
+  observedAt: number;
+  model: string;
+  estimatedApiCostUsd: number | null;
 }
 
 function rows<T>(value: unknown): T[] {
@@ -206,172 +320,127 @@ function localDateString(timestampSeconds: number): string {
   return `${date.getFullYear()}-${month}-${day}`;
 }
 
+export function partIdOf(summary: Pick<ThreadPartSummary, 'partId' | 'sourceFile'>): string {
+  return summary.partId ?? summary.sourceFile;
+}
+
+function eventData(event: StoredThreadEvent, summary: ThreadPartSummary): SyncEventData {
+  return {
+    eventId: event.eventKey,
+    partId: partIdOf(summary),
+    threadId: event.threadId,
+    partKind: summary.partKind,
+    observedAt: event.observedAt,
+    model: event.model,
+    inputTokens: event.inputTokens,
+    cachedInputTokens: event.cachedInputTokens,
+    cacheWriteInputTokens: event.cacheWriteInputTokens ?? 0,
+    cacheWrite1hInputTokens: event.cacheWrite1hInputTokens ?? 0,
+    outputTokens: event.outputTokens,
+    reasoningOutputTokens: event.reasoningOutputTokens,
+    totalTokens: event.totalTokens,
+    estimatedApiCostUsd: event.estimatedApiCostUsd
+  };
+}
+
+function partData(summary: ThreadPartSummary): SyncPartData {
+  return {
+    partId: partIdOf(summary),
+    threadId: summary.threadId,
+    partKind: summary.partKind,
+    sourceFile: summary.sourceFile,
+    title: summary.title,
+    projectPath: summary.projectPath,
+    startedAt: summary.startedAt,
+    updatedAt: summary.updatedAt,
+    primaryModel: summary.primaryModel,
+    models: summary.models,
+    inputTokens: summary.inputTokens,
+    cachedInputTokens: summary.cachedInputTokens,
+    cacheWriteInputTokens: summary.cacheWriteInputTokens ?? 0,
+    cacheWrite1hInputTokens: summary.cacheWrite1hInputTokens ?? 0,
+    outputTokens: summary.outputTokens,
+    reasoningOutputTokens: summary.reasoningOutputTokens,
+    totalTokens: summary.totalTokens,
+    estimatedApiCostUsd: summary.estimatedApiCostUsd,
+    pricingStatus: summary.pricingStatus,
+    userMessageCount: summary.userMessageCount,
+    source: summary.source,
+    sourceLabel: summary.sourceLabel,
+    reportedCostUsd: summary.reportedCostUsd ?? null
+  };
+}
+
+function promptData(prompt: PromptMetric, partId: string): SyncPromptData {
+  return {
+    ...prompt,
+    partId,
+    cacheWriteInputTokens: prompt.cacheWriteInputTokens ?? 0,
+    cacheWrite1hInputTokens: prompt.cacheWrite1hInputTokens ?? 0
+  };
+}
+
+function eventSignature(value: Omit<SyncEventData, 'eventId' | 'partId'>): string {
+  return [
+    value.threadId,
+    value.partKind,
+    value.observedAt,
+    value.model,
+    value.inputTokens,
+    value.cachedInputTokens,
+    value.cacheWriteInputTokens ?? 0,
+    value.cacheWrite1hInputTokens ?? 0,
+    value.outputTokens,
+    value.reasoningOutputTokens,
+    value.totalTokens,
+    value.estimatedApiCostUsd ?? 'null'
+  ].join('|');
+}
+
+function partSignature(value: SyncPartData): string {
+  return JSON.stringify([
+    value.threadId, value.partKind, value.sourceFile, value.title, value.projectPath, value.startedAt,
+    value.updatedAt, value.primaryModel, value.models, value.inputTokens, value.cachedInputTokens,
+    value.cacheWriteInputTokens ?? 0, value.cacheWrite1hInputTokens ?? 0, value.outputTokens,
+    value.reasoningOutputTokens, value.totalTokens, value.estimatedApiCostUsd, value.pricingStatus,
+    value.userMessageCount, value.source, value.sourceLabel, value.reportedCostUsd
+  ]);
+}
+
+function promptSignature(value: SyncPromptData): string {
+  return JSON.stringify([
+    value.partId, value.sourceFile, value.threadId, value.turnId, value.sequence, value.prompt, value.startedAt,
+    value.completedAt, value.durationMs, value.timeToFirstTokenMs, Boolean(value.timingEstimated),
+    value.primaryModel, value.models, value.inputTokens, value.cachedInputTokens,
+    value.cacheWriteInputTokens ?? 0, value.cacheWrite1hInputTokens ?? 0, value.outputTokens,
+    value.reasoningOutputTokens, value.totalTokens, value.estimatedApiCostUsd, value.pricingStatus
+  ]);
+}
+
 export type UsageStore = ReturnType<typeof createUsageStore>;
 
 /**
  * Open (or create) one provider's usage database. Every provider gets its own
- * file so Codex and Claude Code histories never mix.
+ * file so Codex and Claude Code histories never mix. On the central server the
+ * same store also holds the events collectors upload, stamped with their device.
  */
 export function createUsageStore(options: UsageStoreOptions) {
   const dataDir = options.dataDir ?? path.resolve(process.cwd(), 'data');
   fs.mkdirSync(dataDir, { recursive: true });
   const filePath = path.isAbsolute(options.file) ? options.file : path.join(dataDir, options.file);
+  const localDeviceId = options.deviceId ?? DEFAULT_DEVICE_ID;
+  const outboxEnabled = options.outbox === true;
   const db = new DatabaseSync(filePath);
   db.exec('PRAGMA busy_timeout = 5000;');
   db.exec('PRAGMA journal_mode = WAL;');
-  db.exec('PRAGMA foreign_keys = ON;');
+  // Every commit (and so every outbox row and every acknowledged upload) must
+  // survive a power cut.
+  db.exec('PRAGMA synchronous = FULL;');
 
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS rate_limit_snapshots (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      observed_at INTEGER NOT NULL,
-      limit_key TEXT NOT NULL,
-      label TEXT NOT NULL,
-      used_percent REAL NOT NULL,
-      duration_mins INTEGER NOT NULL,
-      resets_at INTEGER NOT NULL,
-      UNIQUE(observed_at, limit_key, resets_at)
-    );
-    CREATE INDEX IF NOT EXISTS idx_rate_history
-      ON rate_limit_snapshots(limit_key, resets_at, observed_at);
-    CREATE INDEX IF NOT EXISTS idx_rate_history_duration
-      ON rate_limit_snapshots(duration_mins, observed_at);
-
-    CREATE TABLE IF NOT EXISTS account_daily_usage (
-      usage_date TEXT PRIMARY KEY,
-      tokens INTEGER NOT NULL,
-      observed_at INTEGER NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS session_parts (
-      source_file TEXT PRIMARY KEY,
-      modified_ms REAL NOT NULL,
-      size_bytes INTEGER NOT NULL,
-      thread_id TEXT NOT NULL,
-      part_kind TEXT NOT NULL,
-      title TEXT,
-      project_path TEXT,
-      started_at INTEGER,
-      updated_at INTEGER,
-      primary_model TEXT NOT NULL,
-      models_json TEXT NOT NULL,
-      input_tokens INTEGER NOT NULL,
-      cached_input_tokens INTEGER NOT NULL,
-      output_tokens INTEGER NOT NULL,
-      reasoning_output_tokens INTEGER NOT NULL,
-      total_tokens INTEGER NOT NULL,
-      estimated_cost_usd REAL,
-      pricing_status TEXT NOT NULL,
-      user_message_count INTEGER NOT NULL DEFAULT 0
-    );
-    CREATE INDEX IF NOT EXISTS idx_session_parts_thread
-      ON session_parts(thread_id, part_kind, updated_at);
-
-    CREATE TABLE IF NOT EXISTS session_part_token_events (
-      event_key TEXT PRIMARY KEY,
-      source_file TEXT NOT NULL,
-      thread_id TEXT NOT NULL,
-      observed_at INTEGER NOT NULL,
-      model TEXT NOT NULL,
-      input_tokens INTEGER NOT NULL,
-      cached_input_tokens INTEGER NOT NULL,
-      output_tokens INTEGER NOT NULL,
-      reasoning_output_tokens INTEGER NOT NULL,
-      total_tokens INTEGER NOT NULL,
-      estimated_cost_usd REAL,
-      FOREIGN KEY(source_file) REFERENCES session_parts(source_file) ON DELETE CASCADE
-    );
-    CREATE INDEX IF NOT EXISTS idx_session_part_events_time
-      ON session_part_token_events(observed_at);
-    CREATE INDEX IF NOT EXISTS idx_session_part_events_thread
-      ON session_part_token_events(thread_id, observed_at);
-
-    CREATE TABLE IF NOT EXISTS prompt_metrics (
-      prompt_id TEXT PRIMARY KEY,
-      source_file TEXT NOT NULL,
-      thread_id TEXT NOT NULL,
-      turn_id TEXT,
-      sequence_number INTEGER NOT NULL,
-      prompt_text TEXT NOT NULL,
-      started_at INTEGER NOT NULL,
-      completed_at INTEGER,
-      duration_ms INTEGER,
-      time_to_first_token_ms INTEGER,
-      timing_estimated INTEGER NOT NULL,
-      primary_model TEXT NOT NULL,
-      models_json TEXT NOT NULL,
-      input_tokens INTEGER NOT NULL,
-      cached_input_tokens INTEGER NOT NULL,
-      output_tokens INTEGER NOT NULL,
-      reasoning_output_tokens INTEGER NOT NULL,
-      total_tokens INTEGER NOT NULL,
-      estimated_cost_usd REAL,
-      pricing_status TEXT NOT NULL,
-      FOREIGN KEY(source_file) REFERENCES session_parts(source_file) ON DELETE CASCADE
-    );
-    CREATE INDEX IF NOT EXISTS idx_prompt_metrics_thread
-      ON prompt_metrics(thread_id, started_at);
-    CREATE INDEX IF NOT EXISTS idx_prompt_metrics_completed
-      ON prompt_metrics(completed_at);
-
-    CREATE TABLE IF NOT EXISTS thread_metadata (
-      thread_id TEXT PRIMARY KEY,
-      display_name TEXT,
-      preview TEXT,
-      updated_at INTEGER NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS cloud_tasks (
-      task_id TEXT PRIMARY KEY,
-      title TEXT NOT NULL,
-      status TEXT NOT NULL,
-      updated_at INTEGER,
-      environment_label TEXT,
-      url TEXT,
-      is_review INTEGER NOT NULL DEFAULT 0,
-      files_changed INTEGER,
-      lines_added INTEGER,
-      lines_removed INTEGER,
-      first_seen_at INTEGER NOT NULL,
-      last_seen_at INTEGER NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS dashboard_meta (
-      key TEXT PRIMARY KEY,
-      value TEXT NOT NULL
-    );
-  `);
-
-  function tableColumns(table: string): Set<string> {
-    return new Set(
-      (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>)
-        .map((row) => row.name)
-    );
-  }
-
-  function ensureColumn(table: string, column: string, definition: string): void {
-    if (!tableColumns(table).has(column)) {
-      db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
-    }
-  }
-
-  ensureColumn('thread_metadata', 'source', 'TEXT');
-  ensureColumn('thread_metadata', 'source_label', 'TEXT');
-  ensureColumn('thread_metadata', 'model', 'TEXT');
-  ensureColumn('thread_metadata', 'reasoning_effort', 'TEXT');
-  ensureColumn('thread_metadata', 'git_branch', 'TEXT');
-  ensureColumn('thread_metadata', 'project_name', 'TEXT');
-  ensureColumn('thread_metadata', 'archived', 'INTEGER NOT NULL DEFAULT 0');
-  ensureColumn('session_parts', 'source', 'TEXT');
-  ensureColumn('session_parts', 'source_label', 'TEXT');
-  // Cache-write accounting and provider-reported cost arrived with the Claude Code provider.
-  ensureColumn('session_parts', 'cache_write_input_tokens', 'INTEGER NOT NULL DEFAULT 0');
-  ensureColumn('session_parts', 'cache_write_1h_input_tokens', 'INTEGER NOT NULL DEFAULT 0');
-  ensureColumn('session_parts', 'reported_cost_usd', 'REAL');
-  ensureColumn('session_part_token_events', 'cache_write_input_tokens', 'INTEGER NOT NULL DEFAULT 0');
-  ensureColumn('session_part_token_events', 'cache_write_1h_input_tokens', 'INTEGER NOT NULL DEFAULT 0');
-  ensureColumn('prompt_metrics', 'cache_write_input_tokens', 'INTEGER NOT NULL DEFAULT 0');
-  ensureColumn('prompt_metrics', 'cache_write_1h_input_tokens', 'INTEGER NOT NULL DEFAULT 0');
+  ensureSchema(db, {
+    deviceId: localDeviceId,
+    legacyPartId: options.legacyPartId ?? ((row) => row.sourceFile)
+  });
 
   function getMeta(key: string): string | null {
     const row = db.prepare('SELECT value FROM dashboard_meta WHERE key = ?').get(key) as
@@ -393,39 +462,221 @@ export function createUsageStore(options: UsageStoreOptions) {
   }
   if (getMeta('provider') === null) setMeta('provider', options.provider);
 
-  function transaction(work: () => void): void {
+  // A configured DEVICE_ID that changed renames this machine's own rows, so its
+  // history stays one device instead of splitting in two.
+  const previousDeviceId = getMeta('local_device_id');
+  if (previousDeviceId !== localDeviceId) {
+    if (previousDeviceId) {
+      db.exec('BEGIN IMMEDIATE;');
+      try {
+        for (const table of ['session_parts', 'session_part_token_events', 'prompt_metrics', 'rate_limit_snapshots']) {
+          db.prepare(`UPDATE ${table} SET device_id = ? WHERE device_id = ?`).run(localDeviceId, previousDeviceId);
+        }
+        // Cached window results name the devices they split usage between.
+        db.exec('DELETE FROM window_attribution;');
+        db.exec('COMMIT;');
+      } catch (error) {
+        db.exec('ROLLBACK;');
+        throw error;
+      }
+    }
+    setMeta('local_device_id', localDeviceId);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Transactions and change tracking
+  // ---------------------------------------------------------------------------
+
+  let depth = 0;
+  let changedRange: [number, number] | null = null;
+  let summariesDirty = false;
+  let outboxDirty = false;
+  const outboxListeners = new Set<() => void>();
+
+  let summaryCache: { builtAt: number; version: number; value: ThreadSummary[] } | null = null;
+  let summaryVersion = 0;
+  /** Bumped after every commit that changed events or quota samples; lets callers memoize. */
+  let eventVersion = 0;
+  let sampleVersion = 0;
+  let samplesDirty = false;
+
+  /** Call after any write that changes thread rows so the summary cache is rebuilt. */
+  function invalidateThreadSummaries(): void {
+    summaryVersion += 1;
+  }
+
+  /** Remember that events around `observedAt` changed. */
+  function touch(observedAt: number | null | undefined): void {
+    summariesDirty = true;
+    if (observedAt === null || observedAt === undefined || !Number.isFinite(observedAt)) return;
+    changedRange = changedRange
+      ? [Math.min(changedRange[0], observedAt), Math.max(changedRange[1], observedAt)]
+      : [observedAt, observedAt];
+  }
+
+  const deleteAttributionStatement = db.prepare(
+    'DELETE FROM window_attribution WHERE bank_start <= ? AND bank_end >= ?'
+  );
+
+  function transaction<T>(work: () => T): T {
+    if (depth > 0) {
+      depth += 1;
+      try {
+        return work();
+      } finally {
+        depth -= 1;
+      }
+    }
     db.exec('BEGIN IMMEDIATE;');
+    depth = 1;
     try {
-      work();
+      const result = work();
+      // Cached attribution for every bank that overlaps a changed event is
+      // dropped in the same transaction, so it can never outlive its inputs.
+      if (changedRange) deleteAttributionStatement.run(changedRange[1], changedRange[0]);
       db.exec('COMMIT;');
+      if (changedRange) eventVersion += 1;
+      if (samplesDirty) sampleVersion += 1;
+      if (summariesDirty) invalidateThreadSummaries();
+      if (outboxDirty) for (const listener of outboxListeners) listener();
+      return result;
     } catch (error) {
       db.exec('ROLLBACK;');
       throw error;
+    } finally {
+      depth = 0;
+      changedRange = null;
+      summariesDirty = false;
+      samplesDirty = false;
+      outboxDirty = false;
     }
   }
 
-  const insertSnapshotStatement = db.prepare(`
-    INSERT OR IGNORE INTO rate_limit_snapshots
-      (observed_at, limit_key, label, used_percent, duration_mins, resets_at)
+  // ---------------------------------------------------------------------------
+  // Outbox (collector role)
+  // ---------------------------------------------------------------------------
+
+  /** Server instance this device last exported its full history to. */
+  let bootstrapInstance = getMeta('sync_bootstrap_instance');
+  const insertOutboxStatement = db.prepare(`
+    INSERT OR REPLACE INTO sync_outbox (kind, record_key, part_id, observed_at, payload, created_at)
     VALUES (?, ?, ?, ?, ?, ?)
   `);
+  const deleteOutboxKeyStatement = db.prepare('DELETE FROM sync_outbox WHERE kind = ? AND record_key = ?');
+  const OPPOSITE: Partial<Record<SyncRecordKind, SyncRecordKind>> = {
+    event: 'remove-event',
+    'remove-event': 'event',
+    prompt: 'remove-prompt',
+    'remove-prompt': 'prompt',
+    part: 'remove-part',
+    'remove-part': 'part'
+  };
 
-  function insertRateLimitSnapshot(limit: RateLimitWindow): void {
-    insertSnapshotStatement.run(
-      limit.observedAt,
-      limit.key,
-      limit.label,
-      limit.usedPercent,
-      limit.windowDurationMins,
-      limit.resetsAt
-    );
+  /**
+   * Queue a record for the central server. A newer record for the same key
+   * replaces the pending one and gets a new sequence number, so an upload that
+   * was already in flight for the old version cannot acknowledge the new one.
+   */
+  function enqueue(
+    kind: SyncRecordKind,
+    key: string,
+    data: unknown,
+    partId: string | null,
+    observedAt: number | null
+  ): void {
+    if (!outboxEnabled) return;
+    const opposite = OPPOSITE[kind];
+    if (opposite) deleteOutboxKeyStatement.run(opposite, key);
+    if (kind === 'remove-part') {
+      // Nothing else about a removed part is worth sending.
+      db.prepare(`
+        DELETE FROM sync_outbox
+        WHERE part_id = ? AND kind IN ('event', 'prompt', 'remove-event', 'remove-prompt')
+      `).run(key);
+    }
+    outboxDirty = true;
+    // Until the first full export reaches a server, it holds nothing from this
+    // device, so a removal would only be noise.
+    if (kind.startsWith('remove-') && bootstrapInstance === null) return;
+    insertOutboxStatement.run(kind, key, partId, observedAt, JSON.stringify(data), Math.floor(Date.now() / 1000));
   }
 
-  function insertRateLimitSnapshots(limits: RateLimitWindow[]): void {
-    if (limits.length === 0) return;
+  function readOutbox(limit: number): SyncRecord[] {
+    return rows<{ seq: number; kind: SyncRecordKind; key: string; payload: string }>(db.prepare(`
+      SELECT seq, kind, record_key AS key, payload FROM sync_outbox ORDER BY seq ASC LIMIT ?
+    `).all(Math.max(1, Math.floor(limit)))).map((row) => ({
+      seq: row.seq,
+      kind: row.kind,
+      key: row.key,
+      data: JSON.parse(row.payload) as unknown
+    }));
+  }
+
+  /** Delete records the server acknowledged. Returns how many were removed. */
+  function ackOutbox(seqs: number[]): number {
+    if (seqs.length === 0) return 0;
+    const statement = db.prepare('DELETE FROM sync_outbox WHERE seq = ?');
+    let removed = 0;
     transaction(() => {
-      for (const limit of limits) insertRateLimitSnapshot(limit);
+      for (const seq of seqs) removed += Number(statement.run(seq).changes);
     });
+    return removed;
+  }
+
+  function outboxStats(): OutboxStats {
+    const row = db.prepare(`
+      SELECT COUNT(*) AS pending,
+             MIN(CASE WHEN kind IN ('event', 'sample') THEN observed_at END) AS oldestPendingAt,
+             MIN(created_at) AS oldestCreatedAt
+      FROM sync_outbox
+    `).get() as { pending: number; oldestPendingAt: number | null; oldestCreatedAt: number | null };
+    return row;
+  }
+
+  function onOutboxChange(listener: () => void): () => void {
+    outboxListeners.add(listener);
+    return () => outboxListeners.delete(listener);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Quota samples
+  // ---------------------------------------------------------------------------
+
+  const insertSnapshotStatement = db.prepare(`
+    INSERT OR IGNORE INTO rate_limit_snapshots
+      (observed_at, limit_key, label, used_percent, duration_mins, resets_at, device_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  function insertSamples(limits: RateLimitWindow[], deviceId: string): number {
+    let inserted = 0;
+    for (const limit of limits) {
+      const result = insertSnapshotStatement.run(
+        limit.observedAt,
+        limit.key,
+        limit.label,
+        limit.usedPercent,
+        limit.windowDurationMins,
+        limit.resetsAt,
+        deviceId
+      );
+      if (Number(result.changes) > 0) {
+        inserted += 1;
+        samplesDirty = true;
+        enqueue('sample', sampleRecordKey(limit), limit, null, limit.observedAt);
+      }
+    }
+    return inserted;
+  }
+
+  function insertRateLimitSnapshot(limit: RateLimitWindow): void {
+    transaction(() => insertSamples([limit], localDeviceId));
+  }
+
+  /** Store quota samples; returns how many were new. */
+  function insertRateLimitSnapshots(limits: RateLimitWindow[]): number {
+    if (limits.length === 0) return 0;
+    return transaction(() => insertSamples(limits, localDeviceId));
   }
 
   /** The most recent stored sample for a window key, if any. */
@@ -502,30 +753,108 @@ export function createUsageStore(options: UsageStoreOptions) {
     return rows<DailyUsage>(result).reverse();
   }
 
-  function getSessionFileState(sourceFile: string): {
-    modifiedMs: number;
-    sizeBytes: number;
-    threadId: string;
-  } | null {
-    const result = db.prepare(`
-      SELECT modified_ms AS modifiedMs, size_bytes AS sizeBytes, thread_id AS threadId
-      FROM session_parts WHERE source_file = ?
-    `).get(sourceFile);
-    return (result as { modifiedMs: number; sizeBytes: number; threadId: string } | undefined) ?? null;
+  // ---------------------------------------------------------------------------
+  // Events, parts, and prompts
+  // ---------------------------------------------------------------------------
+
+  const EVENT_COLUMNS = `
+    event_key AS eventKey, part_id AS partId, device_id AS deviceId, thread_id AS threadId,
+    part_kind AS partKind, observed_at AS observedAt, model, input_tokens AS inputTokens,
+    cached_input_tokens AS cachedInputTokens, cache_write_input_tokens AS cacheWriteInputTokens,
+    cache_write_1h_input_tokens AS cacheWrite1hInputTokens, output_tokens AS outputTokens,
+    reasoning_output_tokens AS reasoningOutputTokens, total_tokens AS totalTokens,
+    estimated_cost_usd AS estimatedApiCostUsd
+  `;
+  const selectEventStatement = db.prepare(`SELECT ${EVENT_COLUMNS} FROM session_part_token_events WHERE event_key = ?`);
+  const selectPartEventsStatement = db.prepare(`
+    SELECT ${EVENT_COLUMNS} FROM session_part_token_events WHERE part_id = ? AND device_id = ?
+  `);
+  const insertEventStatement = db.prepare(`
+    INSERT INTO session_part_token_events (
+      event_key, part_id, device_id, thread_id, part_kind, observed_at, model, input_tokens,
+      cached_input_tokens, cache_write_input_tokens, cache_write_1h_input_tokens, output_tokens,
+      reasoning_output_tokens, total_tokens, estimated_cost_usd, written_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const updateEventStatement = db.prepare(`
+    UPDATE session_part_token_events SET
+      thread_id = ?, part_kind = ?, observed_at = ?, model = ?, input_tokens = ?, cached_input_tokens = ?,
+      cache_write_input_tokens = ?, cache_write_1h_input_tokens = ?, output_tokens = ?,
+      reasoning_output_tokens = ?, total_tokens = ?, estimated_cost_usd = ?, written_at = ?
+    WHERE event_key = ?
+  `);
+  const deleteEventStatement = db.prepare('DELETE FROM session_part_token_events WHERE event_key = ?');
+
+  /**
+   * Insert or update one event. The first device (and part) to report an event
+   * owns it; the same event reported again from elsewhere, for example a
+   * transcript copied between machines, is not counted a second time.
+   */
+  function writeEvent(
+    event: SyncEventData,
+    deviceId: string,
+    known?: EventRow | null
+  ): 'inserted' | 'updated' | 'unchanged' | 'foreign' {
+    const existing = known === undefined
+      ? (selectEventStatement.get(event.eventId) as EventRow | undefined) ?? null
+      : known;
+    const now = Math.floor(Date.now() / 1000);
+    if (!existing) {
+      insertEventStatement.run(
+        event.eventId, event.partId, deviceId, event.threadId, event.partKind, event.observedAt, event.model,
+        event.inputTokens, event.cachedInputTokens, event.cacheWriteInputTokens ?? 0,
+        event.cacheWrite1hInputTokens ?? 0, event.outputTokens, event.reasoningOutputTokens,
+        event.totalTokens, event.estimatedApiCostUsd, now
+      );
+      touch(event.observedAt);
+      enqueue('event', event.eventId, event, event.partId, event.observedAt);
+      return 'inserted';
+    }
+    if (existing.deviceId !== deviceId || existing.partId !== event.partId) return 'foreign';
+    if (eventSignature(existing) === eventSignature(event)) return 'unchanged';
+    updateEventStatement.run(
+      event.threadId, event.partKind, event.observedAt, event.model, event.inputTokens,
+      event.cachedInputTokens, event.cacheWriteInputTokens ?? 0, event.cacheWrite1hInputTokens ?? 0,
+      event.outputTokens, event.reasoningOutputTokens, event.totalTokens, event.estimatedApiCostUsd, now,
+      event.eventId
+    );
+    touch(existing.observedAt);
+    touch(event.observedAt);
+    enqueue('event', event.eventId, event, event.partId, event.observedAt);
+    return 'updated';
   }
 
+  function removeEventRow(eventId: string, deviceId: string, partId: string | null): boolean {
+    const existing = (selectEventStatement.get(eventId) as EventRow | undefined) ?? null;
+    if (!existing || existing.deviceId !== deviceId) return false;
+    deleteEventStatement.run(eventId);
+    touch(existing.observedAt);
+    enqueue('remove-event', eventId, { eventId, partId: partId ?? existing.partId }, existing.partId, null);
+    return true;
+  }
+
+  const selectPartStatement = db.prepare(`
+    SELECT part_id AS partId, device_id AS deviceId, source_file AS sourceFile, thread_id AS threadId,
+           part_kind AS partKind, title, project_path AS projectPath, started_at AS startedAt,
+           updated_at AS updatedAt, primary_model AS primaryModel, models_json AS modelsJson,
+           input_tokens AS inputTokens, cached_input_tokens AS cachedInputTokens,
+           cache_write_input_tokens AS cacheWriteInputTokens,
+           cache_write_1h_input_tokens AS cacheWrite1hInputTokens, output_tokens AS outputTokens,
+           reasoning_output_tokens AS reasoningOutputTokens, total_tokens AS totalTokens,
+           estimated_cost_usd AS estimatedApiCostUsd, pricing_status AS pricingStatus,
+           user_message_count AS userMessageCount, source, source_label AS sourceLabel,
+           reported_cost_usd AS reportedCostUsd
+    FROM session_parts WHERE part_id = ?
+  `);
   const upsertPartStatement = db.prepare(`
     INSERT INTO session_parts (
-      source_file, modified_ms, size_bytes, thread_id, part_kind, title,
-      project_path, started_at, updated_at, primary_model, models_json,
-      input_tokens, cached_input_tokens, output_tokens,
-      reasoning_output_tokens, total_tokens, estimated_cost_usd,
-      pricing_status, user_message_count, source, source_label,
-      cache_write_input_tokens, cache_write_1h_input_tokens, reported_cost_usd
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(source_file) DO UPDATE SET
-      modified_ms = excluded.modified_ms,
-      size_bytes = excluded.size_bytes,
+      part_id, device_id, source_file, thread_id, part_kind, title, project_path, started_at, updated_at,
+      primary_model, models_json, input_tokens, cached_input_tokens, cache_write_input_tokens,
+      cache_write_1h_input_tokens, output_tokens, reasoning_output_tokens, total_tokens,
+      estimated_cost_usd, pricing_status, user_message_count, source, source_label, reported_cost_usd, written_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(part_id) DO UPDATE SET
+      source_file = excluded.source_file,
       thread_id = excluded.thread_id,
       part_kind = excluded.part_kind,
       title = excluded.title,
@@ -536,6 +865,8 @@ export function createUsageStore(options: UsageStoreOptions) {
       models_json = excluded.models_json,
       input_tokens = excluded.input_tokens,
       cached_input_tokens = excluded.cached_input_tokens,
+      cache_write_input_tokens = excluded.cache_write_input_tokens,
+      cache_write_1h_input_tokens = excluded.cache_write_1h_input_tokens,
       output_tokens = excluded.output_tokens,
       reasoning_output_tokens = excluded.reasoning_output_tokens,
       total_tokens = excluded.total_tokens,
@@ -544,190 +875,501 @@ export function createUsageStore(options: UsageStoreOptions) {
       user_message_count = excluded.user_message_count,
       source = excluded.source,
       source_label = excluded.source_label,
-      cache_write_input_tokens = excluded.cache_write_input_tokens,
-      cache_write_1h_input_tokens = excluded.cache_write_1h_input_tokens,
-      reported_cost_usd = excluded.reported_cost_usd
-  `);
-  const insertEventStatement = db.prepare(`
-    INSERT INTO session_part_token_events (
-      event_key, source_file, thread_id, observed_at, model, input_tokens,
-      cached_input_tokens, output_tokens, reasoning_output_tokens,
-      total_tokens, estimated_cost_usd, cache_write_input_tokens, cache_write_1h_input_tokens
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-  const insertPromptStatement = db.prepare(`
-    INSERT INTO prompt_metrics (
-      prompt_id, source_file, thread_id, turn_id, sequence_number, prompt_text,
-      started_at, completed_at, duration_ms, time_to_first_token_ms,
-      timing_estimated, primary_model, models_json, input_tokens,
-      cached_input_tokens, output_tokens, reasoning_output_tokens, total_tokens,
-      estimated_cost_usd, pricing_status, cache_write_input_tokens, cache_write_1h_input_tokens
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      reported_cost_usd = excluded.reported_cost_usd,
+      written_at = excluded.written_at
   `);
 
+  /** Insert or update a part's descriptive row. Returns true when it changed. */
+  function writePart(part: SyncPartData, deviceId: string): boolean {
+    const existing = selectPartStatement.get(part.partId) as
+      | (Omit<SyncPartData, 'models'> & { deviceId: string; modelsJson: string })
+      | undefined;
+    if (existing) {
+      if (existing.deviceId !== deviceId) return false;
+      const current: SyncPartData = { ...existing, models: JSON.parse(existing.modelsJson) as string[] };
+      if (partSignature(current) === partSignature(part)) return false;
+    }
+    upsertPartStatement.run(
+      part.partId, deviceId, part.sourceFile, part.threadId, part.partKind, part.title, part.projectPath,
+      part.startedAt, part.updatedAt, part.primaryModel, JSON.stringify(part.models), part.inputTokens,
+      part.cachedInputTokens, part.cacheWriteInputTokens ?? 0, part.cacheWrite1hInputTokens ?? 0,
+      part.outputTokens, part.reasoningOutputTokens, part.totalTokens, part.estimatedApiCostUsd,
+      part.pricingStatus, part.userMessageCount, part.source, part.sourceLabel, part.reportedCostUsd,
+      Math.floor(Date.now() / 1000)
+    );
+    summariesDirty = true;
+    enqueue('part', part.partId, part, part.partId, null);
+    return true;
+  }
+
+  /** Remove a part with its events and prompts. Only the owning device can. */
+  function removePartRows(partId: string, deviceId: string): boolean {
+    const range = db.prepare(`
+      SELECT MIN(observed_at) AS first, MAX(observed_at) AS last, COUNT(*) AS events
+      FROM session_part_token_events WHERE part_id = ? AND device_id = ?
+    `).get(partId, deviceId) as { first: number | null; last: number | null; events: number };
+    const events = db.prepare('DELETE FROM session_part_token_events WHERE part_id = ? AND device_id = ?')
+      .run(partId, deviceId);
+    const prompts = db.prepare('DELETE FROM prompt_metrics WHERE part_id = ? AND device_id = ?').run(partId, deviceId);
+    const parts = db.prepare('DELETE FROM session_parts WHERE part_id = ? AND device_id = ?').run(partId, deviceId);
+    const changed = Number(events.changes) + Number(prompts.changes) + Number(parts.changes) > 0;
+    if (range.events > 0) {
+      touch(range.first);
+      touch(range.last);
+    }
+    if (changed) {
+      summariesDirty = true;
+      enqueue('remove-part', partId, { partId }, partId, null);
+    }
+    return changed;
+  }
+
+  const PROMPT_COLUMNS = `
+    prompt_id AS promptId, part_id AS partId, device_id AS deviceId, source_file AS sourceFile,
+    thread_id AS threadId, turn_id AS turnId, sequence_number AS sequence, prompt_text AS prompt,
+    started_at AS startedAt, completed_at AS completedAt, duration_ms AS durationMs,
+    time_to_first_token_ms AS timeToFirstTokenMs, timing_estimated AS timingEstimated,
+    primary_model AS primaryModel, models_json AS modelsJson, input_tokens AS inputTokens,
+    cached_input_tokens AS cachedInputTokens, cache_write_input_tokens AS cacheWriteInputTokens,
+    cache_write_1h_input_tokens AS cacheWrite1hInputTokens, output_tokens AS outputTokens,
+    reasoning_output_tokens AS reasoningOutputTokens, total_tokens AS totalTokens,
+    estimated_cost_usd AS estimatedApiCostUsd, pricing_status AS pricingStatus
+  `;
+  const selectPromptStatement = db.prepare(`SELECT ${PROMPT_COLUMNS} FROM prompt_metrics WHERE prompt_id = ?`);
+  const upsertPromptStatement = db.prepare(`
+    INSERT INTO prompt_metrics (
+      prompt_id, part_id, device_id, source_file, thread_id, turn_id, sequence_number, prompt_text,
+      started_at, completed_at, duration_ms, time_to_first_token_ms, timing_estimated, primary_model,
+      models_json, input_tokens, cached_input_tokens, cache_write_input_tokens, cache_write_1h_input_tokens,
+      output_tokens, reasoning_output_tokens, total_tokens, estimated_cost_usd, pricing_status
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(prompt_id) DO UPDATE SET
+      part_id = excluded.part_id,
+      source_file = excluded.source_file,
+      thread_id = excluded.thread_id,
+      turn_id = excluded.turn_id,
+      sequence_number = excluded.sequence_number,
+      prompt_text = excluded.prompt_text,
+      started_at = excluded.started_at,
+      completed_at = excluded.completed_at,
+      duration_ms = excluded.duration_ms,
+      time_to_first_token_ms = excluded.time_to_first_token_ms,
+      timing_estimated = excluded.timing_estimated,
+      primary_model = excluded.primary_model,
+      models_json = excluded.models_json,
+      input_tokens = excluded.input_tokens,
+      cached_input_tokens = excluded.cached_input_tokens,
+      cache_write_input_tokens = excluded.cache_write_input_tokens,
+      cache_write_1h_input_tokens = excluded.cache_write_1h_input_tokens,
+      output_tokens = excluded.output_tokens,
+      reasoning_output_tokens = excluded.reasoning_output_tokens,
+      total_tokens = excluded.total_tokens,
+      estimated_cost_usd = excluded.estimated_cost_usd,
+      pricing_status = excluded.pricing_status
+  `);
+
+  function promptFromRow(row: PromptRow): SyncPromptData {
+    const { modelsJson, deviceId: _deviceId, timingEstimated, ...rest } = row;
+    return { ...rest, timingEstimated: Boolean(timingEstimated), models: JSON.parse(modelsJson) as string[] };
+  }
+
+  function writePrompt(prompt: SyncPromptData, deviceId: string, known?: PromptRow | null): boolean {
+    const existing = known === undefined
+      ? (selectPromptStatement.get(prompt.promptId) as PromptRow | undefined) ?? null
+      : known;
+    if (existing) {
+      if (existing.deviceId !== deviceId) return false;
+      if (promptSignature(promptFromRow(existing)) === promptSignature(prompt)) return false;
+    }
+    upsertPromptStatement.run(
+      prompt.promptId, prompt.partId, deviceId, prompt.sourceFile, prompt.threadId, prompt.turnId,
+      prompt.sequence, prompt.prompt, prompt.startedAt, prompt.completedAt, prompt.durationMs,
+      prompt.timeToFirstTokenMs, prompt.timingEstimated ? 1 : 0, prompt.primaryModel,
+      JSON.stringify(prompt.models), prompt.inputTokens, prompt.cachedInputTokens,
+      prompt.cacheWriteInputTokens ?? 0, prompt.cacheWrite1hInputTokens ?? 0, prompt.outputTokens,
+      prompt.reasoningOutputTokens, prompt.totalTokens, prompt.estimatedApiCostUsd, prompt.pricingStatus
+    );
+    summariesDirty = true;
+    enqueue('prompt', prompt.promptId, prompt, prompt.partId, null);
+    return true;
+  }
+
+  function removePromptRow(promptId: string, deviceId: string): boolean {
+    const existing = (selectPromptStatement.get(promptId) as PromptRow | undefined) ?? null;
+    if (!existing || existing.deviceId !== deviceId) return false;
+    db.prepare('DELETE FROM prompt_metrics WHERE prompt_id = ?').run(promptId);
+    summariesDirty = true;
+    enqueue('remove-prompt', promptId, { promptId, partId: existing.partId }, existing.partId, null);
+    return true;
+  }
+
+  /**
+   * Make the stored rows for one part exactly match a fresh full parse: add and
+   * update what the parse produced, delete what it no longer contains.
+   */
+  function replacePart(part: IndexedPart): boolean {
+    const partId = partIdOf(part.summary);
+    let changed = writePart(partData(part.summary), localDeviceId);
+
+    const existingEvents = new Map(
+      rows<EventRow>(selectPartEventsStatement.all(partId, localDeviceId)).map((row) => [row.eventKey, row])
+    );
+    const seenEvents = new Set<string>();
+    for (const event of part.events) {
+      seenEvents.add(event.eventKey);
+      const result = writeEvent(eventData(event, part.summary), localDeviceId, existingEvents.get(event.eventKey));
+      if (result === 'inserted' || result === 'updated') changed = true;
+    }
+    for (const eventKey of existingEvents.keys()) {
+      if (!seenEvents.has(eventKey)) changed = removeEventRow(eventKey, localDeviceId, partId) || changed;
+    }
+
+    const existingPrompts = new Map(
+      rows<PromptRow>(db.prepare(`
+        SELECT ${PROMPT_COLUMNS} FROM prompt_metrics WHERE part_id = ? AND device_id = ?
+      `).all(partId, localDeviceId)).map((row) => [row.promptId, row])
+    );
+    const seenPrompts = new Set<string>();
+    for (const prompt of part.prompts) {
+      seenPrompts.add(prompt.promptId);
+      changed = writePrompt(promptData(prompt, partId), localDeviceId, existingPrompts.get(prompt.promptId)) || changed;
+    }
+    for (const promptId of existingPrompts.keys()) {
+      if (!seenPrompts.has(promptId)) changed = removePromptRow(promptId, localDeviceId) || changed;
+    }
+    return changed;
+  }
+
+  /** Add the rows produced by newly appended log lines. */
+  function mergePart(part: IndexedPart): boolean {
+    const partId = partIdOf(part.summary);
+    let changed = writePart(partData(part.summary), localDeviceId);
+    for (const event of part.events) {
+      const result = writeEvent(eventData(event, part.summary), localDeviceId);
+      if (result === 'inserted' || result === 'updated') changed = true;
+    }
+    for (const prompt of part.prompts) changed = writePrompt(promptData(prompt, partId), localDeviceId) || changed;
+    return changed;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Local file index
+  // ---------------------------------------------------------------------------
+
+  const selectLocalFileStatement = db.prepare(`
+    SELECT path, part_ids AS partIds, modified_ms AS modifiedMs, size_bytes AS sizeBytes,
+           parser_version AS parserVersion, status, tail_offset AS tailOffset, tail_state AS tailState,
+           head_length AS headLength, head_hash AS headHash, anchor_hash AS anchorHash,
+           depends_on AS dependsOn, depends_stat AS dependsStat, indexed_at AS indexedAt
+    FROM local_files WHERE path = ?
+  `);
+  const upsertLocalFileStatement = db.prepare(`
+    INSERT INTO local_files (
+      path, part_ids, modified_ms, size_bytes, parser_version, status, tail_offset, tail_state,
+      head_length, head_hash, anchor_hash, depends_on, depends_stat, indexed_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(path) DO UPDATE SET
+      part_ids = excluded.part_ids,
+      modified_ms = excluded.modified_ms,
+      size_bytes = excluded.size_bytes,
+      parser_version = excluded.parser_version,
+      status = excluded.status,
+      tail_offset = excluded.tail_offset,
+      tail_state = excluded.tail_state,
+      head_length = excluded.head_length,
+      head_hash = excluded.head_hash,
+      anchor_hash = excluded.anchor_hash,
+      depends_on = excluded.depends_on,
+      depends_stat = excluded.depends_stat,
+      indexed_at = excluded.indexed_at
+  `);
+
+  function getLocalFile(filePath: string): LocalFileRecord | null {
+    const row = selectLocalFileStatement.get(filePath) as (Omit<LocalFileRecord, 'partIds'> & { partIds: string }) | undefined;
+    if (!row) return null;
+    let partIds: string[] = [];
+    try {
+      partIds = JSON.parse(row.partIds) as string[];
+    } catch {
+      partIds = [];
+    }
+    return { ...row, partIds };
+  }
+
+  /** Files whose indexing depends on one of `paths` (Claude continuations). */
+  function filesDependingOn(paths: string[]): string[] {
+    if (paths.length === 0) return [];
+    const statement = db.prepare('SELECT path FROM local_files WHERE depends_on = ?');
+    return [...new Set(paths.flatMap((item) => rows<{ path: string }>(statement.all(item)).map((row) => row.path)))];
+  }
+
+  function listLocalFiles(): string[] {
+    return rows<{ path: string }>(db.prepare('SELECT path FROM local_files').all()).map((row) => row.path);
+  }
+
+  /**
+   * Store the result of parsing one local file, together with where parsing
+   * stopped, in one transaction. A crash in between leaves the previous offset
+   * in place, so the lines are simply parsed again.
+   */
+  function applyFileIndex(filePath: string, update: FileIndexUpdate): { changed: boolean } {
+    return transaction(() => {
+      const previous = getLocalFile(filePath);
+      const previousIds = previous ? previous.partIds : (update.candidatePartIds ?? []);
+      let changed = false;
+      let partIds = previousIds;
+      if (update.parts !== null) {
+        const ids = update.parts.map((part) => partIdOf(part.summary));
+        if (update.mode === 'full') {
+          for (const id of previousIds) {
+            if (!ids.includes(id)) changed = removePartRows(id, localDeviceId) || changed;
+          }
+          for (const part of update.parts) changed = replacePart(part) || changed;
+          partIds = ids;
+        } else {
+          for (const part of update.parts) changed = mergePart(part) || changed;
+          partIds = [...new Set([...previousIds, ...ids])];
+        }
+        for (const part of update.parts) {
+          if (part.limits && part.limits.length > 0) insertSamples(part.limits, localDeviceId);
+        }
+      }
+      if (update.metadata && update.metadata.length > 0) changed = upsertMetadataRows(update.metadata) || changed;
+      upsertLocalFileStatement.run(
+        filePath, JSON.stringify(partIds), update.file.modifiedMs, update.file.sizeBytes, update.file.parserVersion,
+        update.file.status, update.file.tailOffset, update.file.tailState, update.file.headLength,
+        update.file.headHash, update.file.anchorHash, update.file.dependsOn, update.file.dependsStat,
+        Math.floor(Date.now() / 1000)
+      );
+      return { changed };
+    });
+  }
+
+  /** Replace one part's rows. Kept for tests and simple callers. */
   function replaceThreadData(
     summary: ThreadPartSummary,
     events: StoredThreadEvent[],
     prompts: PromptMetric[],
-    fileState: { modifiedMs: number; sizeBytes: number }
+    _fileState?: { modifiedMs: number; sizeBytes: number }
   ): void {
     transaction(() => {
-      upsertPartStatement.run(
-        summary.sourceFile,
-        fileState.modifiedMs,
-        fileState.sizeBytes,
-        summary.threadId,
-        summary.partKind,
-        summary.title,
-        summary.projectPath,
-        summary.startedAt,
-        summary.updatedAt,
-        summary.primaryModel,
-        JSON.stringify(summary.models),
-        summary.inputTokens,
-        summary.cachedInputTokens,
-        summary.outputTokens,
-        summary.reasoningOutputTokens,
-        summary.totalTokens,
-        summary.estimatedApiCostUsd,
-        summary.pricingStatus,
-        summary.userMessageCount,
-        summary.source,
-        summary.sourceLabel,
-        summary.cacheWriteInputTokens ?? 0,
-        summary.cacheWrite1hInputTokens ?? 0,
-        summary.reportedCostUsd ?? null
+      replacePart({ summary, events, prompts });
+    });
+  }
+
+  /** Remove parts (by part id) this device produced, with their events and prompts. */
+  function removeSessionParts(partIds: string[]): void {
+    if (partIds.length === 0) return;
+    transaction(() => {
+      for (const partId of partIds) removePartRows(partId, localDeviceId);
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Chat metadata
+  // ---------------------------------------------------------------------------
+
+  const selectMetadataStatement = db.prepare(`
+    SELECT thread_id AS threadId, display_name AS displayName, preview, updated_at AS updatedAt,
+           source, source_label AS sourceLabel, model, reasoning_effort AS reasoningEffort,
+           git_branch AS gitBranch, project_name AS projectName, archived
+    FROM thread_metadata WHERE thread_id = ?
+  `);
+  const upsertMetadataStatement = db.prepare(`
+    INSERT INTO thread_metadata (
+      thread_id, display_name, preview, updated_at, source, source_label, model,
+      reasoning_effort, git_branch, project_name, archived
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(thread_id) DO UPDATE SET
+      display_name = excluded.display_name,
+      preview = excluded.preview,
+      updated_at = excluded.updated_at,
+      source = excluded.source,
+      source_label = excluded.source_label,
+      model = excluded.model,
+      reasoning_effort = excluded.reasoning_effort,
+      git_branch = excluded.git_branch,
+      project_name = excluded.project_name,
+      archived = excluded.archived
+  `);
+
+  /**
+   * Merge chat metadata: known values win over unknown ones, the newest
+   * timestamp wins, and an unknown archived flag keeps the stored one. Only rows
+   * that actually change are written (and queued for the server).
+   */
+  function upsertMetadataRows(items: ThreadMetadataInput[]): boolean {
+    let changed = false;
+    for (const item of items) {
+      const existing = (selectMetadataStatement.get(item.threadId) as MetadataRow | undefined) ?? null;
+      const merged: MetadataRow = {
+        threadId: item.threadId,
+        displayName: item.displayName ?? existing?.displayName ?? null,
+        preview: item.preview ?? existing?.preview ?? null,
+        updatedAt: existing ? Math.max(item.updatedAt, existing.updatedAt) : item.updatedAt,
+        source: item.source ?? existing?.source ?? null,
+        sourceLabel: item.sourceLabel ?? existing?.sourceLabel ?? null,
+        model: item.model ?? existing?.model ?? null,
+        reasoningEffort: item.reasoningEffort ?? existing?.reasoningEffort ?? null,
+        gitBranch: item.gitBranch ?? existing?.gitBranch ?? null,
+        projectName: item.projectName ?? existing?.projectName ?? null,
+        archived: item.archived === undefined ? (existing?.archived ?? 0) : item.archived ? 1 : 0
+      };
+      if (existing && JSON.stringify(existing) === JSON.stringify(merged)) continue;
+      upsertMetadataStatement.run(
+        merged.threadId, merged.displayName, merged.preview, merged.updatedAt, merged.source,
+        merged.sourceLabel, merged.model, merged.reasoningEffort, merged.gitBranch, merged.projectName,
+        merged.archived
       );
-      db.prepare('DELETE FROM session_part_token_events WHERE source_file = ?').run(summary.sourceFile);
-      db.prepare('DELETE FROM prompt_metrics WHERE source_file = ?').run(summary.sourceFile);
-      for (const event of events) {
-        insertEventStatement.run(
-          event.eventKey,
-          event.sourceFile,
-          event.threadId,
-          event.observedAt,
-          event.model,
-          event.inputTokens,
-          event.cachedInputTokens,
-          event.outputTokens,
-          event.reasoningOutputTokens,
-          event.totalTokens,
-          event.estimatedApiCostUsd,
-          event.cacheWriteInputTokens ?? 0,
-          event.cacheWrite1hInputTokens ?? 0
-        );
-      }
-      for (const prompt of prompts) {
-        insertPromptStatement.run(
-          prompt.promptId,
-          prompt.sourceFile,
-          prompt.threadId,
-          prompt.turnId,
-          prompt.sequence,
-          prompt.prompt,
-          prompt.startedAt,
-          prompt.completedAt,
-          prompt.durationMs,
-          prompt.timeToFirstTokenMs,
-          prompt.timingEstimated ? 1 : 0,
-          prompt.primaryModel,
-          JSON.stringify(prompt.models),
-          prompt.inputTokens,
-          prompt.cachedInputTokens,
-          prompt.outputTokens,
-          prompt.reasoningOutputTokens,
-          prompt.totalTokens,
-          prompt.estimatedApiCostUsd,
-          prompt.pricingStatus,
-          prompt.cacheWriteInputTokens ?? 0,
-          prompt.cacheWrite1hInputTokens ?? 0
-        );
-      }
-    });
-    invalidateThreadSummaries();
+      enqueue('thread', merged.threadId, {
+        threadId: merged.threadId,
+        displayName: merged.displayName,
+        preview: merged.preview,
+        updatedAt: merged.updatedAt,
+        source: merged.source,
+        sourceLabel: merged.sourceLabel,
+        model: merged.model,
+        reasoningEffort: merged.reasoningEffort,
+        gitBranch: merged.gitBranch,
+        projectName: merged.projectName,
+        archived: merged.archived === 1
+      } satisfies ThreadMetadataInput, null, null);
+      summariesDirty = true;
+      changed = true;
+    }
+    return changed;
   }
 
-  /** Drop parts whose source file no longer exists on disk. */
-  function removeSessionParts(sourceFiles: string[]): void {
-    if (sourceFiles.length === 0) return;
-    const statement = db.prepare('DELETE FROM session_parts WHERE source_file = ?');
+  function upsertThreadMetadata(items: ThreadMetadataInput[]): boolean {
+    if (items.length === 0) return false;
+    return transaction(() => upsertMetadataRows(items));
+  }
+
+  // ---------------------------------------------------------------------------
+  // Remote ingestion (server role)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Store validated records from a collector. Everything is written in one
+   * transaction; the returned sequence numbers are only acknowledged after it
+   * committed. Costs are recomputed with this server's price table so every
+   * device is priced the same way.
+   */
+  function ingestRemoteRecords(deviceId: string, records: ParsedSyncRecord[]): { acked: number[] } {
+    if (records.length === 0) return { acked: [] };
+    return transaction(() => {
+      for (const record of records) {
+        switch (record.kind) {
+          case 'event': {
+            const priced = estimateUsageCost(record.data.model, record.data, record.data.observedAt);
+            writeEvent({ ...record.data, estimatedApiCostUsd: priced ?? record.data.estimatedApiCostUsd }, deviceId);
+            break;
+          }
+          case 'part':
+            writePart(record.data, deviceId);
+            break;
+          case 'prompt':
+            writePrompt(record.data, deviceId);
+            break;
+          case 'thread':
+            upsertMetadataRows([record.data]);
+            break;
+          case 'sample':
+            insertSamples([record.data], deviceId);
+            break;
+          case 'remove-part':
+            removePartRows(record.data.partId, deviceId);
+            break;
+          case 'remove-event':
+            removeEventRow(record.data.eventId, deviceId, null);
+            break;
+          case 'remove-prompt':
+            removePromptRow(record.data.promptId, deviceId);
+            break;
+        }
+      }
+      return { acked: records.map((record) => record.seq) };
+    });
+  }
+
+  /**
+   * Queue everything this device has ever indexed. A collector does this the
+   * first time it reaches a server (or a server whose database was reset), so
+   * history collected before multi-device mode is not lost. Uploads are
+   * idempotent, so records the server already has cost nothing.
+   */
+  function exportAllToOutbox(serverInstanceId: string): number {
+    if (!outboxEnabled) return 0;
+    let queued = 0;
     transaction(() => {
-      for (const sourceFile of sourceFiles) statement.run(sourceFile);
-    });
-    invalidateThreadSummaries();
-  }
-
-  function listSessionFiles(): string[] {
-    return rows<{ sourceFile: string }>(
-      db.prepare('SELECT source_file AS sourceFile FROM session_parts').all()
-    ).map((row) => row.sourceFile);
-  }
-
-  function upsertThreadMetadata(items: ThreadMetadataInput[]): void {
-    // `archived` is NOT NULL, so an unknown value inserts as 0 but must not
-    // overwrite a stored 1 on conflict; the CASE keeps the existing flag then.
-    const statement = db.prepare(`
-      INSERT INTO thread_metadata (
-        thread_id, display_name, preview, updated_at, source, source_label, model,
-        reasoning_effort, git_branch, project_name, archived
-      )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(thread_id) DO UPDATE SET
-        display_name = COALESCE(excluded.display_name, thread_metadata.display_name),
-        preview = COALESCE(excluded.preview, thread_metadata.preview),
-        updated_at = MAX(excluded.updated_at, thread_metadata.updated_at),
-        source = COALESCE(excluded.source, thread_metadata.source),
-        source_label = COALESCE(excluded.source_label, thread_metadata.source_label),
-        model = COALESCE(excluded.model, thread_metadata.model),
-        reasoning_effort = COALESCE(excluded.reasoning_effort, thread_metadata.reasoning_effort),
-        git_branch = COALESCE(excluded.git_branch, thread_metadata.git_branch),
-        project_name = COALESCE(excluded.project_name, thread_metadata.project_name),
-        archived = CASE WHEN ? IS NULL THEN thread_metadata.archived ELSE excluded.archived END
-    `);
-    transaction(() => {
-      for (const item of items) {
-        const archived = item.archived === undefined ? null : item.archived ? 1 : 0;
-        statement.run(
-          item.threadId,
-          item.displayName,
-          item.preview,
-          item.updatedAt,
-          item.source ?? null,
-          item.sourceLabel ?? null,
-          item.model ?? null,
-          item.reasoningEffort ?? null,
-          item.gitBranch ?? null,
-          item.projectName ?? null,
-          archived ?? 0,
-          archived
-        );
+      setMeta('sync_bootstrap_instance', serverInstanceId);
+      const partRows = rows<Omit<SyncPartData, 'models'> & { modelsJson: string }>(db.prepare(`
+        SELECT part_id AS partId, thread_id AS threadId, part_kind AS partKind, source_file AS sourceFile,
+               title, project_path AS projectPath, started_at AS startedAt, updated_at AS updatedAt,
+               primary_model AS primaryModel, models_json AS modelsJson, input_tokens AS inputTokens,
+               cached_input_tokens AS cachedInputTokens, cache_write_input_tokens AS cacheWriteInputTokens,
+               cache_write_1h_input_tokens AS cacheWrite1hInputTokens, output_tokens AS outputTokens,
+               reasoning_output_tokens AS reasoningOutputTokens, total_tokens AS totalTokens,
+               estimated_cost_usd AS estimatedApiCostUsd, pricing_status AS pricingStatus,
+               user_message_count AS userMessageCount, COALESCE(source, 'unknown') AS source,
+               source_label AS sourceLabel, reported_cost_usd AS reportedCostUsd
+        FROM session_parts WHERE device_id = ?
+      `).all(localDeviceId));
+      for (const { modelsJson, ...row } of partRows) {
+        enqueue('part', row.partId, { ...row, models: JSON.parse(modelsJson) as string[] }, row.partId, null);
+        queued += 1;
+      }
+      for (const row of rows<EventRow>(db.prepare(`
+        SELECT ${EVENT_COLUMNS} FROM session_part_token_events WHERE device_id = ? ORDER BY observed_at ASC
+      `).all(localDeviceId))) {
+        const { eventKey, deviceId: _deviceId, ...rest } = row;
+        enqueue('event', eventKey, { eventId: eventKey, ...rest } satisfies SyncEventData, row.partId, row.observedAt);
+        queued += 1;
+      }
+      for (const row of rows<PromptRow>(db.prepare(`
+        SELECT ${PROMPT_COLUMNS} FROM prompt_metrics WHERE device_id = ?
+      `).all(localDeviceId))) {
+        enqueue('prompt', row.promptId, promptFromRow(row), row.partId, null);
+        queued += 1;
+      }
+      for (const row of rows<MetadataRow>(db.prepare(`
+        SELECT thread_id AS threadId, display_name AS displayName, preview, updated_at AS updatedAt,
+               source, source_label AS sourceLabel, model, reasoning_effort AS reasoningEffort,
+               git_branch AS gitBranch, project_name AS projectName, archived
+        FROM thread_metadata
+      `).all())) {
+        enqueue('thread', row.threadId, { ...row, archived: row.archived === 1 }, null, null);
+        queued += 1;
+      }
+      for (const row of rows<RateLimitWindow>(db.prepare(`
+        SELECT limit_key AS key, label, used_percent AS usedPercent, duration_mins AS windowDurationMins,
+               resets_at AS resetsAt, observed_at AS observedAt
+        FROM rate_limit_snapshots WHERE device_id IS NULL OR device_id = ?
+        ORDER BY observed_at ASC
+      `).all(localDeviceId))) {
+        enqueue('sample', sampleRecordKey(row), row, null, row.observedAt);
+        queued += 1;
       }
     });
-    invalidateThreadSummaries();
+    bootstrapInstance = serverInstanceId;
+    return queued;
   }
+
+  // ---------------------------------------------------------------------------
+  // Thread summaries (derived from events, so nothing can be counted twice)
+  // ---------------------------------------------------------------------------
 
   function getPromptMap(): Map<string, PromptMetric[]> {
     const promptRows = rows<PromptRow>(db.prepare(`
-      SELECT prompt_id AS promptId, source_file AS sourceFile, thread_id AS threadId,
-             turn_id AS turnId, sequence_number AS sequence, prompt_text AS prompt,
-             started_at AS startedAt, completed_at AS completedAt,
-             duration_ms AS durationMs, time_to_first_token_ms AS timeToFirstTokenMs,
-             timing_estimated AS timingEstimated, primary_model AS primaryModel,
-             models_json AS modelsJson, input_tokens AS inputTokens,
-             cached_input_tokens AS cachedInputTokens, output_tokens AS outputTokens,
-             reasoning_output_tokens AS reasoningOutputTokens, total_tokens AS totalTokens,
-             estimated_cost_usd AS estimatedApiCostUsd, pricing_status AS pricingStatus,
-             cache_write_input_tokens AS cacheWriteInputTokens,
-             cache_write_1h_input_tokens AS cacheWrite1hInputTokens
-      FROM prompt_metrics
-      ORDER BY started_at ASC, sequence_number ASC
+      SELECT ${PROMPT_COLUMNS} FROM prompt_metrics ORDER BY started_at ASC, sequence_number ASC
     `).all());
     const map = new Map<string, PromptMetric[]>();
     for (const row of promptRows) {
+      const { partId: _partId, deviceId: _deviceId, modelsJson, timingEstimated, ...rest } = row;
       const item: PromptMetric = {
-        ...row,
-        timingEstimated: Boolean(row.timingEstimated),
-        models: JSON.parse(row.modelsJson) as string[]
+        ...rest,
+        timingEstimated: Boolean(timingEstimated),
+        models: JSON.parse(modelsJson) as string[]
       };
       const list = map.get(row.threadId) ?? [];
       list.push(item);
@@ -736,40 +1378,76 @@ export function createUsageStore(options: UsageStoreOptions) {
     return map;
   }
 
-  let summaryCache: { builtAt: number; version: number; value: ThreadSummary[] } | null = null;
-  let summaryVersion = 0;
-
-  /** Call after any write that changes thread rows so the summary cache is rebuilt. */
-  function invalidateThreadSummaries(): void {
-    summaryVersion += 1;
-  }
-
   function buildThreadSummaries(): ThreadSummary[] {
     const now = Date.now();
     if (summaryCache && summaryCache.version === summaryVersion && now - summaryCache.builtAt < 15_000) {
       return summaryCache.value;
     }
 
-    const parts = rows<PartRow>(db.prepare(`
-      SELECT source_file AS sourceFile, thread_id AS threadId, part_kind AS partKind,
-             title, project_path AS projectPath, started_at AS startedAt,
-             updated_at AS updatedAt, primary_model AS primaryModel,
-             models_json AS modelsJson, input_tokens AS inputTokens,
-             cached_input_tokens AS cachedInputTokens, output_tokens AS outputTokens,
-             reasoning_output_tokens AS reasoningOutputTokens,
-             total_tokens AS totalTokens, estimated_cost_usd AS estimatedApiCostUsd,
-             pricing_status AS pricingStatus, user_message_count AS userMessageCount,
-             source, source_label AS sourceLabel,
-             cache_write_input_tokens AS cacheWriteInputTokens,
-             cache_write_1h_input_tokens AS cacheWrite1hInputTokens,
-             reported_cost_usd AS reportedCostUsd
+    const descriptors = rows<PartRow>(db.prepare(`
+      SELECT part_id AS partId, device_id AS deviceId, source_file AS sourceFile, thread_id AS threadId,
+             part_kind AS partKind, title, project_path AS projectPath, started_at AS startedAt,
+             updated_at AS updatedAt, primary_model AS primaryModel, user_message_count AS userMessageCount,
+             source, source_label AS sourceLabel, reported_cost_usd AS reportedCostUsd
       FROM session_parts
-      ORDER BY COALESCE(started_at, updated_at, 0) ASC
     `).all());
+    const totals = new Map(rows<PartTotalsRow>(db.prepare(`
+      SELECT part_id AS partId, MIN(thread_id) AS threadId, MIN(part_kind) AS partKind,
+             MIN(device_id) AS deviceId,
+             SUM(input_tokens) AS inputTokens, SUM(cached_input_tokens) AS cachedInputTokens,
+             SUM(cache_write_input_tokens) AS cacheWriteInputTokens,
+             SUM(cache_write_1h_input_tokens) AS cacheWrite1hInputTokens,
+             SUM(output_tokens) AS outputTokens, SUM(reasoning_output_tokens) AS reasoningOutputTokens,
+             SUM(total_tokens) AS totalTokens, SUM(estimated_cost_usd) AS estimatedApiCostUsd,
+             SUM(CASE WHEN estimated_cost_usd IS NOT NULL THEN 1 ELSE 0 END) AS pricedEvents,
+             SUM(CASE WHEN estimated_cost_usd IS NULL AND lower(model) <> '${AUTO_REVIEW_MODEL}' THEN 1 ELSE 0 END)
+               AS unpricedEvents,
+             MIN(observed_at) AS firstEventAt, MAX(observed_at) AS lastEventAt
+      FROM session_part_token_events
+      GROUP BY part_id
+    `).all()).map((row) => [row.partId, row]));
+    const partModels = new Map<string, Array<{ model: string; tokens: number }>>();
+    for (const row of rows<PartModelRow>(db.prepare(`
+      SELECT part_id AS partId, model, SUM(total_tokens) AS totalTokens
+      FROM session_part_token_events
+      GROUP BY part_id, model
+      ORDER BY totalTokens DESC
+    `).all())) {
+      const list = partModels.get(row.partId) ?? [];
+      list.push({ model: row.model, tokens: row.totalTokens });
+      partModels.set(row.partId, list);
+    }
+
+    // Every part with a descriptor, plus parts whose events arrived before
+    // their descriptor (possible while a collector is still uploading).
+    type Part = PartRow & { totals: PartTotalsRow | null };
+    const parts: Part[] = descriptors.map((row) => ({ ...row, totals: totals.get(row.partId) ?? null }));
+    const described = new Set(descriptors.map((row) => row.partId));
+    for (const row of totals.values()) {
+      if (described.has(row.partId)) continue;
+      parts.push({
+        partId: row.partId,
+        deviceId: row.deviceId,
+        sourceFile: row.partId,
+        threadId: row.threadId,
+        partKind: row.partKind,
+        title: null,
+        projectPath: null,
+        startedAt: row.firstEventAt,
+        updatedAt: row.lastEventAt,
+        primaryModel: partModels.get(row.partId)?.[0]?.model ?? 'unknown',
+        userMessageCount: 0,
+        source: null,
+        sourceLabel: null,
+        reportedCostUsd: null,
+        totals: row
+      });
+    }
+    parts.sort((a, b) => (a.startedAt ?? a.updatedAt ?? 0) - (b.startedAt ?? b.updatedAt ?? 0));
 
     const metadata = new Map(
       rows<MetadataRow>(db.prepare(`
-        SELECT thread_id AS threadId, display_name AS displayName, preview,
+        SELECT thread_id AS threadId, display_name AS displayName, preview, updated_at AS updatedAt,
                source, source_label AS sourceLabel, model, reasoning_effort AS reasoningEffort,
                git_branch AS gitBranch, project_name AS projectName, archived
         FROM thread_metadata
@@ -777,24 +1455,31 @@ export function createUsageStore(options: UsageStoreOptions) {
     );
     const promptMap = getPromptMap();
 
-    const mainModelTokens = rows<ModelTokenRow>(db.prepare(`
-      SELECT e.thread_id AS threadId, e.model, SUM(e.total_tokens) AS totalTokens
-      FROM session_part_token_events e
-      JOIN session_parts p ON p.source_file = e.source_file
-      WHERE p.part_kind = 'main' AND lower(e.model) <> '${AUTO_REVIEW_MODEL}'
-      GROUP BY e.thread_id, e.model
-    `).all());
     const modelWeights = new Map<string, Map<string, number>>();
-    for (const row of mainModelTokens) {
-      const weights = modelWeights.get(row.threadId) ?? new Map<string, number>();
-      weights.set(row.model, row.totalTokens);
-      modelWeights.set(row.threadId, weights);
+    for (const part of parts) {
+      if (part.partKind !== 'main') continue;
+      for (const entry of partModels.get(part.partId) ?? []) {
+        if (entry.model.toLowerCase() === AUTO_REVIEW_MODEL) continue;
+        const weights = modelWeights.get(part.threadId) ?? new Map<string, number>();
+        weights.set(entry.model, (weights.get(entry.model) ?? 0) + entry.tokens);
+        modelWeights.set(part.threadId, weights);
+      }
     }
 
     type Draft = ThreadSummary & { hasPriced: boolean; hasUnpriced: boolean; promptTitle: string | null };
     const grouped = new Map<string, Draft>();
     for (const part of parts) {
-      const partModels = JSON.parse(part.modelsJson) as string[];
+      const partTotals = part.totals;
+      const priced = partTotals?.pricedEvents ?? 0;
+      const partPricing: PricingStatus = priced === 0
+        ? 'unknown'
+        : (partTotals?.unpricedEvents ?? 0) > 0
+          ? 'partial'
+          : 'exact-model-match';
+      const partCost = priced > 0 ? (partTotals?.estimatedApiCostUsd ?? 0) : null;
+      const startedAt = part.startedAt ?? partTotals?.firstEventAt ?? null;
+      const updatedAt = part.updatedAt ?? partTotals?.lastEventAt ?? null;
+
       let thread = grouped.get(part.threadId);
       if (!thread) {
         thread = {
@@ -809,8 +1494,8 @@ export function createUsageStore(options: UsageStoreOptions) {
           reasoningEffort: null,
           gitBranch: null,
           archived: false,
-          startedAt: part.startedAt,
-          updatedAt: part.updatedAt,
+          startedAt,
+          updatedAt,
           primaryModel: part.partKind === 'main' ? part.primaryModel : 'unknown',
           models: [],
           inputTokens: 0,
@@ -828,6 +1513,7 @@ export function createUsageStore(options: UsageStoreOptions) {
           subagentTokens: 0,
           partCount: 0,
           reportedCostUsd: null,
+          deviceIds: [],
           prompts: [],
           usage: { fiveHour: null, sevenDay: null },
           hasPriced: false,
@@ -849,38 +1535,43 @@ export function createUsageStore(options: UsageStoreOptions) {
         thread.userMessageCount += part.userMessageCount;
         // Review sessions are priced by their parent; only main and subagent parts
         // decide whether a thread's cost estimate is complete.
-        if (part.pricingStatus !== 'exact-model-match') thread.hasUnpriced = true;
-      } else if (part.partKind === 'subagent' && part.pricingStatus !== 'exact-model-match') {
+        if (partPricing !== 'exact-model-match') thread.hasUnpriced = true;
+      } else if (part.partKind === 'subagent' && partPricing !== 'exact-model-match') {
         thread.hasUnpriced = true;
       }
       if (part.reportedCostUsd !== null && part.reportedCostUsd !== undefined) {
         thread.reportedCostUsd = (thread.reportedCostUsd ?? 0) + part.reportedCostUsd;
       }
+      if (!thread.deviceIds.includes(part.deviceId)) thread.deviceIds.push(part.deviceId);
 
       thread.startedAt = thread.startedAt === null
-        ? part.startedAt
-        : part.startedAt === null
+        ? startedAt
+        : startedAt === null
           ? thread.startedAt
-          : Math.min(thread.startedAt, part.startedAt);
+          : Math.min(thread.startedAt, startedAt);
       thread.updatedAt = thread.updatedAt === null
-        ? part.updatedAt
-        : part.updatedAt === null
+        ? updatedAt
+        : updatedAt === null
           ? thread.updatedAt
-          : Math.max(thread.updatedAt, part.updatedAt);
-      thread.inputTokens += part.inputTokens;
-      thread.cachedInputTokens += part.cachedInputTokens;
-      thread.outputTokens += part.outputTokens;
-      thread.reasoningOutputTokens += part.reasoningOutputTokens;
-      thread.totalTokens += part.totalTokens;
-      thread.cacheWriteInputTokens = (thread.cacheWriteInputTokens ?? 0) + (part.cacheWriteInputTokens ?? 0);
-      thread.cacheWrite1hInputTokens =
-        (thread.cacheWrite1hInputTokens ?? 0) + (part.cacheWrite1hInputTokens ?? 0);
-      if (part.partKind === 'reviewer') thread.reviewerTokens += part.totalTokens;
-      if (part.partKind === 'subagent') thread.subagentTokens += part.totalTokens;
+          : Math.max(thread.updatedAt, updatedAt);
+      if (partTotals) {
+        thread.inputTokens += partTotals.inputTokens;
+        thread.cachedInputTokens += partTotals.cachedInputTokens;
+        thread.outputTokens += partTotals.outputTokens;
+        thread.reasoningOutputTokens += partTotals.reasoningOutputTokens;
+        thread.totalTokens += partTotals.totalTokens;
+        thread.cacheWriteInputTokens = (thread.cacheWriteInputTokens ?? 0) + (partTotals.cacheWriteInputTokens ?? 0);
+        thread.cacheWrite1hInputTokens =
+          (thread.cacheWrite1hInputTokens ?? 0) + (partTotals.cacheWrite1hInputTokens ?? 0);
+        if (part.partKind === 'reviewer') thread.reviewerTokens += partTotals.totalTokens;
+        if (part.partKind === 'subagent') thread.subagentTokens += partTotals.totalTokens;
+      }
       thread.partCount += 1;
-      for (const model of partModels) if (!thread.models.includes(model)) thread.models.push(model);
-      if (part.estimatedApiCostUsd !== null) {
-        thread.estimatedApiCostUsd = (thread.estimatedApiCostUsd ?? 0) + part.estimatedApiCostUsd;
+      for (const entry of partModels.get(part.partId) ?? []) {
+        if (!thread.models.includes(entry.model)) thread.models.push(entry.model);
+      }
+      if (partCost !== null) {
+        thread.estimatedApiCostUsd = (thread.estimatedApiCostUsd ?? 0) + partCost;
         thread.hasPriced = true;
       }
     }
@@ -954,6 +1645,22 @@ export function createUsageStore(options: UsageStoreOptions) {
       buildThreadSummaries().map((thread) => [
         thread.threadId,
         { title: thread.title, model: thread.primaryModel }
+      ])
+    );
+  }
+
+  function getThreadLookup(): Map<string, ThreadLookupEntry> {
+    return new Map(
+      buildThreadSummaries().map((thread) => [
+        thread.threadId,
+        {
+          title: thread.title,
+          model: thread.primaryModel,
+          source: thread.source,
+          sourceLabel: thread.sourceLabel,
+          projectName: thread.projectName,
+          deviceIds: thread.deviceIds
+        }
       ])
     );
   }
@@ -1043,16 +1750,14 @@ export function createUsageStore(options: UsageStoreOptions) {
     };
   }
 
-  /** Token events inside a time range, joined with the kind of session that produced them. */
+  /** Token events inside a time range, from every device, in log-time order. */
   function getTokenEventsBetween(start: number, end: number): TokenEventRow[] {
     return rows<TokenEventRow>(db.prepare(`
-      SELECT e.observed_at AS observedAt, e.thread_id AS threadId, e.model,
-             p.part_kind AS partKind, e.total_tokens AS totalTokens,
-             e.estimated_cost_usd AS estimatedApiCostUsd
-      FROM session_part_token_events e
-      JOIN session_parts p ON p.source_file = e.source_file
-      WHERE e.observed_at >= ? AND e.observed_at <= ?
-      ORDER BY e.observed_at ASC
+      SELECT observed_at AS observedAt, thread_id AS threadId, model, part_kind AS partKind,
+             device_id AS deviceId, total_tokens AS totalTokens, estimated_cost_usd AS estimatedApiCostUsd
+      FROM session_part_token_events
+      WHERE observed_at >= ? AND observed_at <= ?
+      ORDER BY observed_at ASC, event_key ASC
     `).all(start, end));
   }
 
@@ -1129,6 +1834,63 @@ export function createUsageStore(options: UsageStoreOptions) {
     }));
   }
 
+  /** Event counts per device, for the device list and multi-device detection. */
+  function getDeviceUsage(): Array<{ deviceId: string; events: number; tokens: number; lastEventAt: number | null }> {
+    return rows(db.prepare(`
+      SELECT device_id AS deviceId, COUNT(*) AS events, SUM(total_tokens) AS tokens, MAX(observed_at) AS lastEventAt
+      FROM session_part_token_events
+      GROUP BY device_id
+    `).all());
+  }
+
+  // ---------------------------------------------------------------------------
+  // Per-window attribution cache
+  // ---------------------------------------------------------------------------
+
+  function getWindowAttribution(scope: string, durationMins: number, resetsAt: number): CachedAttribution | null {
+    const row = db.prepare(`
+      SELECT signature, result_json AS resultJson, computed_at AS computedAt
+      FROM window_attribution WHERE scope = ? AND duration_mins = ? AND resets_at = ?
+    `).get(scope, durationMins, resetsAt) as CachedAttribution | undefined;
+    return row ?? null;
+  }
+
+  function putWindowAttribution(row: {
+    scope: string;
+    durationMins: number;
+    resetsAt: number;
+    bankStart: number;
+    bankEnd: number;
+    signature: string;
+    resultJson: string;
+  }): void {
+    db.prepare(`
+      INSERT INTO window_attribution (scope, duration_mins, resets_at, bank_start, bank_end, signature, computed_at, result_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(scope, duration_mins, resets_at) DO UPDATE SET
+        bank_start = excluded.bank_start,
+        bank_end = excluded.bank_end,
+        signature = excluded.signature,
+        computed_at = excluded.computed_at,
+        result_json = excluded.result_json
+    `).run(
+      row.scope, row.durationMins, row.resetsAt, row.bankStart, row.bankEnd, row.signature,
+      Math.floor(Date.now() / 1000), row.resultJson
+    );
+  }
+
+  function clearWindowAttribution(): void {
+    db.exec('DELETE FROM window_attribution');
+  }
+
+  function countWindowAttribution(): number {
+    return (db.prepare('SELECT COUNT(*) AS count FROM window_attribution').get() as { count: number }).count;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Cloud tasks
+  // ---------------------------------------------------------------------------
+
   function upsertCloudTasks(tasks: CloudTask[]): void {
     const now = Math.floor(Date.now() / 1000);
     const statement = db.prepare(`
@@ -1202,12 +1964,15 @@ export function createUsageStore(options: UsageStoreOptions) {
   }
 
   function close(): void {
+    outboxListeners.clear();
     db.close();
   }
 
   return {
     provider: options.provider,
     filePath,
+    deviceId: localDeviceId,
+    outboxEnabled,
     getMeta,
     setMeta,
     insertRateLimitSnapshot,
@@ -1216,14 +1981,26 @@ export function createUsageStore(options: UsageStoreOptions) {
     getRateLimitHistory,
     upsertAccountDailyUsage,
     getAccountDailyUsage,
-    getSessionFileState,
+    getLocalFile,
+    listLocalFiles,
+    filesDependingOn,
+    applyFileIndex,
     replaceThreadData,
     removeSessionParts,
-    listSessionFiles,
     upsertThreadMetadata,
+    ingestRemoteRecords,
+    readOutbox,
+    ackOutbox,
+    outboxStats,
+    onOutboxChange,
+    exportAllToOutbox,
+    exportedToInstance: () => bootstrapInstance,
+    eventVersion: () => eventVersion,
+    sampleVersion: () => sampleVersion,
     invalidateThreadSummaries,
     getThreadSummaries,
     getThreadTitleMap,
+    getThreadLookup,
     getTokenTotals,
     getLocalDailyUsage,
     getLocalAccountStats,
@@ -1231,6 +2008,11 @@ export function createUsageStore(options: UsageStoreOptions) {
     getPromptRunsBetween,
     getHourlyActivity,
     getModelUsageSummaries,
+    getDeviceUsage,
+    getWindowAttribution,
+    putWindowAttribution,
+    clearWindowAttribution,
+    countWindowAttribution,
     upsertCloudTasks,
     getCloudTasks,
     countCloudTasksBetween,

@@ -14,6 +14,8 @@ interface WindowCardProps {
   primary?: boolean;
   now: number;
   onSelectThread: (threadId: string) => void;
+  /** Shown while attribution still waits for a device to sync. */
+  provisionalNote?: string | null;
 }
 
 interface Segment {
@@ -84,7 +86,8 @@ export function WindowCard({
   copy,
   primary = false,
   now,
-  onSelectThread
+  onSelectThread,
+  provisionalNote = null
 }: WindowCardProps) {
   if (!limit) {
     return (
@@ -202,6 +205,16 @@ export function WindowCard({
           <div>
             <dt>Cloud tasks</dt>
             <dd>{breakdown.cloudTasksInWindow} in window</dd>
+          </div>
+        ) : null}
+        {breakdown?.provisional && provisionalNote ? (
+          <div>
+            <dt>Chat shares</dt>
+            <dd>
+              <span className="provisional-tag" title={`${provisionalNote}; shares update when its events arrive.`}>
+                Provisional
+              </span>
+            </dd>
           </div>
         ) : null}
       </dl>

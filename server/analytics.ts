@@ -2,16 +2,13 @@ import type { PromptRunRow, TokenEventRow, UsageStore } from './db.js';
 import {
   RESET_DROP_THRESHOLD,
   attributeQuotaUsage,
-  coverageOf,
   type QuotaEvent
 } from './threadUsage.js';
 import type {
   LimitProjection,
   ModelEfficiency,
   ProjectionPoint,
-  RateLimitWindow,
-  ThreadWindowUsage,
-  WindowBreakdown
+  RateLimitWindow
 } from './types.js';
 
 /**
@@ -37,7 +34,6 @@ const EMPTY_PROJECTION: LimitProjection = {
 /** Used to weight tokens from models without a public price (auto-review). */
 const DEFAULT_COST_PER_TOKEN = 2.5 / 1_000_000;
 const MODEL_EFFICIENCY_LOOKBACK_DAYS = 15;
-const THREAD_USAGE_LOOKBACK_DAYS = 30;
 /**
  * Sources disagree on a reset time by a few seconds, and an idle window reports
  * a reset time that slides forward with every poll. Reset times closer together
@@ -157,6 +153,27 @@ export function calculateProjection(
   };
 }
 
+/** A usage chart cannot show more points than this anyway, and far more stall the browser. */
+export const MAX_CHART_POINTS = 720;
+
+/**
+ * Keep every point where the value moves or a reset happens, then thin the
+ * flat stretches evenly. The shape of the curve survives either way.
+ */
+export function thinChartPoints(points: ProjectionPoint[], max = MAX_CHART_POINTS): ProjectionPoint[] {
+  if (points.length <= max) return points;
+  const changes = points.filter((point, index) =>
+    index === 0 || index === points.length - 1 || point.reset || point.usedPercent !== points[index - 1].usedPercent
+  );
+  if (changes.length <= max) return changes;
+  const step = changes.length / max;
+  const thinned: ProjectionPoint[] = [];
+  for (let index = 0; index < max; index += 1) thinned.push(changes[Math.floor(index * step)]);
+  const last = changes.at(-1)!;
+  if (thinned.at(-1) !== last) thinned.push(last);
+  return thinned;
+}
+
 export function buildChartPoints(
   current: RateLimitWindow | null,
   history: RateLimitWindow[],
@@ -169,14 +186,14 @@ export function buildChartPoints(
       )[0] ?? []
     : groupWindowHistory(history, history.at(-1)?.key ?? '').flat();
   const ordered = [...selectedHistory].sort((a, b) => a.observedAt - b.observedAt);
-  const points: ProjectionPoint[] = ordered.map((point, index) => ({
+  const points: ProjectionPoint[] = thinChartPoints(ordered.map((point, index) => ({
     timestamp: point.observedAt,
     usedPercent: point.usedPercent,
     reset: index > 0 && (
       point.resetsAt !== ordered[index - 1].resetsAt ||
       point.usedPercent < ordered[index - 1].usedPercent - RESET_DROP_THRESHOLD
     )
-  }));
+  })));
   if (!current || projection.projectedPercentAtReset === null) return points;
 
   const nowPoint = points.at(-1);
@@ -299,7 +316,7 @@ export function sameBank(a: number, b: number, tolerance = BANK_TOLERANCE_SECOND
   return Math.abs(a - b) <= tolerance;
 }
 
-function fallbackCostPerToken(events: TokenEventRow[]): number {
+export function fallbackCostPerToken(events: TokenEventRow[]): number {
   let cost = 0;
   let tokens = 0;
   for (const event of events) {
@@ -363,127 +380,6 @@ function bankRanges(
     ranges.push({ resetsAt, start, end: Math.min(resetsAt, now), samples });
   }
   return ranges;
-}
-
-function estimateThreadUsageForWindow(
-  store: UsageStore,
-  currentWindow: RateLimitWindow | null,
-  durationMins: number,
-  lookbackDays: number,
-  now: number,
-  keys?: string[]
-): Map<string, ThreadWindowUsage> {
-  const history = store.getRateLimitHistory(durationMins, undefined, lookbackDays, keys);
-  const banks = bankRanges(history, durationMins, now);
-  if (banks.length === 0) return new Map();
-
-  const earliest = Math.min(...banks.map((bank) => bank.start));
-  const allEvents = store.getTokenEventsBetween(earliest, now);
-  const costPerToken = fallbackCostPerToken(allEvents);
-  const result = new Map<string, ThreadWindowUsage>();
-
-  for (const bank of banks) {
-    const events = toQuotaEvents(
-      sliceEvents(allEvents, bank.start, bank.end),
-      (event) => event.threadId,
-      costPerToken
-    );
-    if (events.length === 0) continue;
-    const attribution = attributeQuotaUsage(bank.samples, events);
-    for (const [threadId, row] of attribution.byKey) {
-      if (row.totalWeight <= 0) continue;
-      const previous = result.get(threadId);
-      // Report the most recent bank the chat was active in.
-      if (previous && previous.windowResetsAt > bank.resetsAt) continue;
-      result.set(threadId, {
-        percent: row.percent,
-        coverage: coverageOf(row),
-        sharedPercent: row.sharedPercent,
-        spans: row.spans,
-        windowResetsAt: bank.resetsAt,
-        current: currentWindow !== null && sameBank(currentWindow.resetsAt, bank.resetsAt)
-      });
-    }
-  }
-  return result;
-}
-
-export function calculateThreadUsageEstimates(
-  store: UsageStore,
-  fiveHourWindow: RateLimitWindow | null,
-  sevenDayWindow: RateLimitWindow | null,
-  keys: HistoryKeys = {}
-): Map<string, { fiveHour: ThreadWindowUsage | null; sevenDay: ThreadWindowUsage | null }> {
-  const now = Math.floor(Date.now() / 1000);
-  const fiveHour = estimateThreadUsageForWindow(
-    store, fiveHourWindow, 300, THREAD_USAGE_LOOKBACK_DAYS, now, keys.fiveHour
-  );
-  const sevenDay = estimateThreadUsageForWindow(
-    store, sevenDayWindow, 10_080, THREAD_USAGE_LOOKBACK_DAYS, now, keys.sevenDay
-  );
-  const ids = new Set([...fiveHour.keys(), ...sevenDay.keys()]);
-  return new Map(
-    [...ids].map((threadId) => [threadId, {
-      fiveHour: fiveHour.get(threadId) ?? null,
-      sevenDay: sevenDay.get(threadId) ?? null
-    }])
-  );
-}
-
-/** Where the usage in the currently reported bank came from. */
-export function calculateWindowBreakdown(
-  store: UsageStore,
-  current: RateLimitWindow | null,
-  history: RateLimitWindow[],
-  topThreads = 8
-): WindowBreakdown | null {
-  if (!current) return null;
-  const now = Math.floor(Date.now() / 1000);
-  const banks = mergedBankHistories(history);
-  const bankKey = [...banks.keys()].find((resetsAt) => sameBank(resetsAt, current.resetsAt));
-  const samples = bankKey !== undefined ? [...banks.get(bankKey)!] : [];
-  if (!samples.some((point) => point.observedAt === current.observedAt)) {
-    samples.push({ ...current, resetsAt: bankKey ?? current.resetsAt });
-  }
-  const windowStartsAt = current.resetsAt - current.windowDurationMins * 60;
-  const rawEvents = store.getTokenEventsBetween(windowStartsAt, now);
-  const attribution = attributeQuotaUsage(
-    samples,
-    toQuotaEvents(rawEvents, (event) => event.threadId)
-  );
-  const titles = store.getThreadTitleMap();
-  const threads = [...attribution.byKey.entries()]
-    .filter(([, row]) => row.percent > 0)
-    .sort((a, b) => b[1].percent - a[1].percent)
-    .slice(0, topThreads)
-    .map(([threadId, row]) => ({
-      threadId,
-      title: titles.get(threadId)?.title ?? 'Untitled chat',
-      model: titles.get(threadId)?.model ?? 'unknown',
-      percent: row.percent,
-      coverage: coverageOf(row)
-    }));
-  const listed = new Set(threads.map((thread) => thread.threadId));
-  const activity = store.getPromptRunsBetween(windowStartsAt, now)
-    .filter((run) => listed.has(run.threadId))
-    .slice(0, 400)
-    .map((run) => ({
-      threadId: run.threadId,
-      startedAt: Math.max(run.startedAt, windowStartsAt),
-      completedAt: Math.min(run.completedAt, now)
-    }));
-
-  return {
-    resetsAt: current.resetsAt,
-    windowStartsAt,
-    observedDeltaPercent: attribution.observedDeltaPercent,
-    attributedPercent: attribution.attributedPercent,
-    unattributedPercent: attribution.unattributedPercent,
-    samples: samples.length,
-    threads,
-    activity,
-    cloudTasksInWindow: store.countCloudTasksBetween(windowStartsAt, now)
-  };
 }
 
 interface EfficiencyAccumulator {

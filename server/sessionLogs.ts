@@ -1,13 +1,20 @@
 import crypto from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
-import fs from 'node:fs';
-import readline from 'node:readline';
 import type { StoredThreadEvent, UsageStore } from './db.js';
 import { classifyThreadSource } from './codex/localThreadMetadata.js';
 import { cleanUserMessage, extractRawUserMessage } from './messageText.js';
 import { estimateUsageCost, findPricing } from './pricing.js';
-import { listFilesRecursive, scanSessionFiles, type ParsedSessionPart, type ScanResult } from './sessionScan.js';
+import {
+  feedFile,
+  listFilesRecursive,
+  scanAllSessions,
+  type ParseOutput,
+  type ParsedSessionPart,
+  type ResumableParser,
+  type ScanResult,
+  type SessionSource
+} from './sessionScan.js';
 import type {
   PricingStatus,
   PromptMetric,
@@ -234,6 +241,7 @@ function extractRateLimitWindows(record: JsonRecord, observedAt: number): RateLi
   return result;
 }
 
+
 interface PromptAccumulator extends PromptMetric {
   firstTokenAt: number | null;
   modelTokens: Map<string, number>;
@@ -242,53 +250,177 @@ interface PromptAccumulator extends PromptMetric {
   hasUnpriced: boolean;
 }
 
+type SerializedPrompt = Omit<PromptAccumulator, 'modelTokens'> & { modelTokens: Array<[string, number]> };
+
+/** Bump when parsing changes so every rollout is indexed again. */
+export const CODEX_PARSER_VERSION = '7';
+
+/** Everything needed to continue parsing a rollout after its last complete line. */
+interface CodexParserState {
+  version: string;
+  lineNumber: number;
+  threadId: string | null;
+  title: string | null;
+  projectPath: string | null;
+  currentModel: string;
+  partKind: SessionPartKind;
+  source: ThreadSource;
+  sourceLabel: string | null;
+  startedAt: number | null;
+  updatedAt: number | null;
+  userMessageCount: number;
+  promptSequence: number;
+  currentTurnId: string | null;
+  currentTaskStartedAt: number | null;
+  promptsInCurrentTurn: number;
+  activePrompt: SerializedPrompt | null;
+  seenUserMessages: string[];
+  totals: TokenUsage;
+  modelTokens: Array<[string, number]>;
+  models: string[];
+  totalCost: number;
+  pricedEvents: number;
+  eventCount: number;
+  promptCount: number;
+}
+
 export interface ParsedSession extends ParsedSessionPart {
   limits: RateLimitWindow[];
 }
 
 /**
- * Parse one Codex rollout file. Pure: it never touches the database, so the
- * scanner (and tests) decide what to do with the result.
+ * A rollout keeps its file name when Codex moves it into `archived_sessions`,
+ * so the name (not the path) identifies the part on every device.
  */
-export async function parseSessionFile(sourceFile: string): Promise<ParsedSession | null> {
-  const stream = fs.createReadStream(sourceFile, { encoding: 'utf8' });
-  const lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
+export function codexPartId(sourceFile: string): string {
+  // Split on both separators so rows migrated from another OS map the same way.
+  return sourceFile.replace(/#sidechain$/, '').split(/[\\/]/).filter(Boolean).at(-1) ?? sourceFile;
+}
 
-  let threadId: string | null = null;
-  let title: string | null = null;
-  let projectPath: string | null = null;
-  let currentModel = 'unknown';
-  let partKind: SessionPartKind = 'main';
-  let source: ThreadSource = 'unknown';
-  let sourceLabel: string | null = null;
-  let startedAt: number | null = null;
-  let updatedAt: number | null = null;
-  let lineNumber = 0;
-  let userMessageCount = 0;
-  let promptSequence = 0;
-  let currentTurnId: string | null = null;
-  let currentTaskStartedAt: number | null = null;
-  let promptsInCurrentTurn = 0;
-  let activePrompt: PromptAccumulator | null = null;
-  const seenUserMessages = new Set<string>();
-  const events: StoredThreadEvent[] = [];
-  const prompts: PromptMetric[] = [];
-  const limits: RateLimitWindow[] = [];
-  const totals = defaultUsage();
-  const modelTokens = new Map<string, number>();
-  const models = new Set<string>();
-  let totalCost = 0;
-  let pricedEvents = 0;
+function userMessageKey(cleaned: string): string {
+  return crypto.createHash('sha1').update(cleaned.toLowerCase()).digest('hex').slice(0, 24);
+}
 
-  const finalizePrompt = (
+/**
+ * Resumable parser for one Codex rollout file. It never touches the database,
+ * so the scanner (and tests) decide what to do with the result.
+ */
+export class CodexRolloutParser implements ResumableParser {
+  private lineNumber = 0;
+  private threadId: string | null = null;
+  private title: string | null = null;
+  private projectPath: string | null = null;
+  private currentModel = 'unknown';
+  private partKind: SessionPartKind = 'main';
+  private source: ThreadSource = 'unknown';
+  private sourceLabel: string | null = null;
+  private startedAt: number | null = null;
+  private updatedAt: number | null = null;
+  private userMessageCount = 0;
+  private promptSequence = 0;
+  private currentTurnId: string | null = null;
+  private currentTaskStartedAt: number | null = null;
+  private promptsInCurrentTurn = 0;
+  private activePrompt: PromptAccumulator | null = null;
+  private readonly seenUserMessages = new Set<string>();
+  private totals = defaultUsage();
+  private readonly modelTokens = new Map<string, number>();
+  private readonly models = new Set<string>();
+  private totalCost = 0;
+  private pricedEvents = 0;
+  private eventCount = 0;
+  private promptCount = 0;
+  /** Produced since this parser was created or restored. */
+  private readonly events: StoredThreadEvent[] = [];
+  private readonly prompts: PromptMetric[] = [];
+  private readonly limits: RateLimitWindow[] = [];
+
+  constructor(
+    readonly sourceFile: string,
+    readonly partId = codexPartId(sourceFile),
+    state?: unknown
+  ) {
+    if (state !== undefined) this.restore(state);
+  }
+
+  private restore(raw: unknown): void {
+    const state = raw as CodexParserState;
+    if (!state || typeof state !== 'object' || state.version !== CODEX_PARSER_VERSION) {
+      throw new Error('Saved Codex parser state is from another parser version');
+    }
+    this.lineNumber = state.lineNumber;
+    this.threadId = state.threadId;
+    this.title = state.title;
+    this.projectPath = state.projectPath;
+    this.currentModel = state.currentModel;
+    this.partKind = state.partKind;
+    this.source = state.source;
+    this.sourceLabel = state.sourceLabel;
+    this.startedAt = state.startedAt;
+    this.updatedAt = state.updatedAt;
+    this.userMessageCount = state.userMessageCount;
+    this.promptSequence = state.promptSequence;
+    this.currentTurnId = state.currentTurnId;
+    this.currentTaskStartedAt = state.currentTaskStartedAt;
+    this.promptsInCurrentTurn = state.promptsInCurrentTurn;
+    this.activePrompt = state.activePrompt
+      ? { ...state.activePrompt, modelTokens: new Map(state.activePrompt.modelTokens) }
+      : null;
+    for (const key of state.seenUserMessages) this.seenUserMessages.add(key);
+    this.totals = { ...state.totals };
+    for (const [model, tokens] of state.modelTokens) this.modelTokens.set(model, tokens);
+    for (const model of state.models) this.models.add(model);
+    this.totalCost = state.totalCost;
+    this.pricedEvents = state.pricedEvents;
+    this.eventCount = state.eventCount;
+    this.promptCount = state.promptCount;
+  }
+
+  snapshot(): CodexParserState {
+    return {
+      version: CODEX_PARSER_VERSION,
+      lineNumber: this.lineNumber,
+      threadId: this.threadId,
+      title: this.title,
+      projectPath: this.projectPath,
+      currentModel: this.currentModel,
+      partKind: this.partKind,
+      source: this.source,
+      sourceLabel: this.sourceLabel,
+      startedAt: this.startedAt,
+      updatedAt: this.updatedAt,
+      userMessageCount: this.userMessageCount,
+      promptSequence: this.promptSequence,
+      currentTurnId: this.currentTurnId,
+      currentTaskStartedAt: this.currentTaskStartedAt,
+      promptsInCurrentTurn: this.promptsInCurrentTurn,
+      activePrompt: this.activePrompt
+        ? { ...this.activePrompt, modelTokens: [...this.activePrompt.modelTokens.entries()] }
+        : null,
+      seenUserMessages: [...this.seenUserMessages],
+      totals: { ...this.totals },
+      modelTokens: [...this.modelTokens.entries()],
+      models: [...this.models],
+      totalCost: this.totalCost,
+      pricedEvents: this.pricedEvents,
+      eventCount: this.eventCount,
+      promptCount: this.promptCount
+    };
+  }
+
+  identity(): string {
+    return `${this.threadId ?? ''}|${this.partKind}`;
+  }
+
+  private finalizePrompt(
     completedAt: number | null,
     reportedDurationMs: number | null = null,
     reportedTimeToFirstTokenMs: number | null = null
-  ): void => {
-    if (!activePrompt) return;
-    const prompt = activePrompt;
+  ): void {
+    if (!this.activePrompt) return;
+    const prompt = this.activePrompt;
     const derivedDuration = completedAt === null ? null : Math.max(0, (completedAt - prompt.startedAt) * 1000);
-    const canUseReportedTiming = promptsInCurrentTurn === 1 && currentTaskStartedAt !== null;
+    const canUseReportedTiming = this.promptsInCurrentTurn === 1 && this.currentTaskStartedAt !== null;
     prompt.completedAt = completedAt;
     prompt.durationMs = canUseReportedTiming && reportedDurationMs !== null
       ? reportedDurationMs
@@ -316,72 +448,73 @@ export async function parseSessionFile(sourceFile: string): Promise<ParsedSessio
       hasUnpriced: _hasUnpriced,
       ...stored
     } = prompt;
-    prompts.push(stored);
-    activePrompt = null;
-  };
+    this.prompts.push(stored);
+    this.promptCount += 1;
+    this.activePrompt = null;
+  }
 
-  for await (const line of lines) {
-    lineNumber += 1;
-    if (!line.trim()) continue;
+  feed(line: string): void {
+    this.lineNumber += 1;
+    if (!line.trim()) return;
     let record: JsonRecord;
     try {
       const parsed = JSON.parse(line) as unknown;
-      if (!isRecord(parsed)) continue;
+      if (!isRecord(parsed)) return;
       record = parsed;
     } catch {
-      continue;
+      return;
     }
 
     const timestamp = recordTimestamp(record);
     if (timestamp !== null) {
-      startedAt = startedAt === null ? timestamp : Math.min(startedAt, timestamp);
-      updatedAt = updatedAt === null ? timestamp : Math.max(updatedAt, timestamp);
+      this.startedAt = this.startedAt === null ? timestamp : Math.min(this.startedAt, timestamp);
+      this.updatedAt = this.updatedAt === null ? timestamp : Math.max(this.updatedAt, timestamp);
     }
 
-    threadId ??= extractThreadId(record);
-    projectPath ??= extractProjectPath(record);
-    partKind = detectPartKind(record) ?? partKind;
+    this.threadId ??= extractThreadId(record);
+    this.projectPath ??= extractProjectPath(record);
+    this.partKind = detectPartKind(record) ?? this.partKind;
     const detectedSource = detectSource(record);
     if (detectedSource) {
-      source = detectedSource.source;
-      sourceLabel = detectedSource.sourceLabel;
+      this.source = detectedSource.source;
+      this.sourceLabel = detectedSource.sourceLabel;
     }
 
     const payload = isRecord(record.payload) ? record.payload : null;
     const type = eventType(record);
     if (type === 'task_started' && payload) {
-      finalizePrompt(timestamp);
-      currentTurnId = typeof payload.turn_id === 'string' ? payload.turn_id : currentTurnId;
-      currentTaskStartedAt = parseTimestamp(payload.started_at) ?? timestamp;
-      promptsInCurrentTurn = 0;
+      this.finalizePrompt(timestamp);
+      this.currentTurnId = typeof payload.turn_id === 'string' ? payload.turn_id : this.currentTurnId;
+      this.currentTaskStartedAt = parseTimestamp(payload.started_at) ?? timestamp;
+      this.promptsInCurrentTurn = 0;
     }
 
     const rawUserMessage = extractRawUserMessage(record);
     if (rawUserMessage) {
       const cleaned = cleanUserMessage(rawUserMessage);
       if (cleaned) {
-        const dedupeKey = cleaned.toLowerCase();
-        if (!seenUserMessages.has(dedupeKey) && partKind === 'main') {
-          seenUserMessages.add(dedupeKey);
-          finalizePrompt(timestamp);
-          userMessageCount += 1;
-          promptSequence += 1;
-          promptsInCurrentTurn += 1;
-          title ??= cleaned.slice(0, 120);
-          const promptStartedAt = timestamp ?? currentTaskStartedAt ?? Math.floor(Date.now() / 1000);
-          activePrompt = {
-            promptId: crypto.createHash('sha1').update(`${sourceFile}:${lineNumber}:${cleaned}`).digest('hex'),
-            sourceFile,
+        const dedupeKey = userMessageKey(cleaned);
+        if (!this.seenUserMessages.has(dedupeKey) && this.partKind === 'main') {
+          this.seenUserMessages.add(dedupeKey);
+          this.finalizePrompt(timestamp);
+          this.userMessageCount += 1;
+          this.promptSequence += 1;
+          this.promptsInCurrentTurn += 1;
+          this.title ??= cleaned.slice(0, 120);
+          const promptStartedAt = timestamp ?? this.currentTaskStartedAt ?? Math.floor(Date.now() / 1000);
+          this.activePrompt = {
+            promptId: crypto.createHash('sha1').update(`${this.partId}:${this.lineNumber}:${cleaned}`).digest('hex'),
+            sourceFile: this.sourceFile,
             threadId: '',
-            turnId: currentTurnId,
-            sequence: promptSequence,
+            turnId: this.currentTurnId,
+            sequence: this.promptSequence,
             prompt: cleaned,
             startedAt: promptStartedAt,
             completedAt: null,
             durationMs: null,
             timeToFirstTokenMs: null,
             timingEstimated: true,
-            primaryModel: currentModel,
+            primaryModel: this.currentModel,
             models: [],
             ...defaultUsage(),
             estimatedApiCostUsd: null,
@@ -398,47 +531,50 @@ export async function parseSessionFile(sourceFile: string): Promise<ParsedSessio
 
     const model = extractModel(record);
     if (model) {
-      currentModel = model;
-      if (model.toLowerCase() === AUTO_REVIEW_MODEL) partKind = 'reviewer';
+      this.currentModel = model;
+      if (model.toLowerCase() === AUTO_REVIEW_MODEL) this.partKind = 'reviewer';
     }
 
     const usage = findIncrementalUsage(record);
     if (usage) {
-      const observedAt = timestamp ?? updatedAt ?? Math.floor(Date.now() / 1000);
-      limits.push(...extractRateLimitWindows(record, observedAt));
-      const cost = estimateUsageCost(currentModel, usage, observedAt);
+      const observedAt = timestamp ?? this.updatedAt ?? Math.floor(Date.now() / 1000);
+      this.limits.push(...extractRateLimitWindows(record, observedAt));
+      const cost = estimateUsageCost(this.currentModel, usage, observedAt);
+      // The rollout name, line, and time identify this response on any device.
       const eventKey = crypto
         .createHash('sha1')
-        .update(`${sourceFile}:${lineNumber}:${observedAt}`)
+        .update(`codex:${this.partId}:${this.lineNumber}:${observedAt}`)
         .digest('hex');
-      events.push({
+      this.events.push({
         eventKey,
         threadId: '',
-        sourceFile,
+        sourceFile: this.sourceFile,
         observedAt,
-        model: currentModel,
+        model: this.currentModel,
         ...usage,
         estimatedApiCostUsd: cost
       });
-      addUsage(totals, usage);
-      models.add(currentModel);
-      modelTokens.set(currentModel, (modelTokens.get(currentModel) ?? 0) + usage.totalTokens);
+      this.eventCount += 1;
+      addUsage(this.totals, usage);
+      this.models.add(this.currentModel);
+      this.modelTokens.set(this.currentModel, (this.modelTokens.get(this.currentModel) ?? 0) + usage.totalTokens);
       if (cost !== null) {
-        totalCost += cost;
-        pricedEvents += 1;
+        this.totalCost += cost;
+        this.pricedEvents += 1;
       }
 
-      if (activePrompt) {
-        addUsage(activePrompt, usage);
-        activePrompt.firstTokenAt ??= observedAt;
-        activePrompt.modelTokens.set(
-          currentModel,
-          (activePrompt.modelTokens.get(currentModel) ?? 0) + usage.totalTokens
+      const prompt = this.activePrompt;
+      if (prompt) {
+        addUsage(prompt, usage);
+        prompt.firstTokenAt ??= observedAt;
+        prompt.modelTokens.set(
+          this.currentModel,
+          (prompt.modelTokens.get(this.currentModel) ?? 0) + usage.totalTokens
         );
-        if (cost === null) activePrompt.hasUnpriced = true;
+        if (cost === null) prompt.hasUnpriced = true;
         else {
-          activePrompt.totalCost += cost;
-          activePrompt.pricedEvents += 1;
+          prompt.totalCost += cost;
+          prompt.pricedEvents += 1;
         }
       }
     }
@@ -447,69 +583,94 @@ export async function parseSessionFile(sourceFile: string): Promise<ParsedSessio
       const completedAt = parseTimestamp(payload.completed_at) ?? timestamp;
       const durationMs = toFiniteNumber(payload.duration_ms);
       const ttftMs = toFiniteNumber(payload.time_to_first_token_ms);
-      finalizePrompt(completedAt, durationMs, ttftMs);
-      currentTurnId = null;
-      currentTaskStartedAt = null;
-      promptsInCurrentTurn = 0;
+      this.finalizePrompt(completedAt, durationMs, ttftMs);
+      this.currentTurnId = null;
+      this.currentTaskStartedAt = null;
+      this.promptsInCurrentTurn = 0;
     }
   }
 
-  finalizePrompt(updatedAt);
-  if (events.length === 0 && prompts.length === 0) return null;
-  const fallbackId = crypto.createHash('sha1').update(sourceFile).digest('hex');
-  const finalThreadId = threadId ?? fallbackId;
-  for (const event of events) event.threadId = finalThreadId;
-  for (const prompt of prompts) prompt.threadId = finalThreadId;
+  /**
+   * The part as of the last line fed: whole-file totals, with the events and
+   * prompts produced by this pass. A prompt still in progress is reported with
+   * the latest timestamp as its end, and reported again once it completes.
+   */
+  result(): ParsedSession | null {
+    this.finalizePrompt(this.updatedAt);
+    if (this.eventCount === 0 && this.promptCount === 0) return null;
+    const finalThreadId = this.threadId ?? crypto.createHash('sha1').update(this.partId).digest('hex');
+    for (const event of this.events) event.threadId = finalThreadId;
+    for (const prompt of this.prompts) prompt.threadId = finalThreadId;
 
-  const primaryModel =
-    [...modelTokens.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? currentModel;
-  // Auto-review has no public API price, so it never makes a chat's estimate "partial".
-  const unknownModels = [...models].filter(
-    (model) => model.toLowerCase() !== AUTO_REVIEW_MODEL && findPricing(model) === null
-  );
-  const pricingStatus: PricingStatus =
-    pricedEvents === 0 ? 'unknown' : unknownModels.length > 0 ? 'partial' : 'exact-model-match';
+    const primaryModel =
+      [...this.modelTokens.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? this.currentModel;
+    // Auto-review has no public API price, so it never makes a chat's estimate "partial".
+    const unknownModels = [...this.models].filter(
+      (model) => model.toLowerCase() !== AUTO_REVIEW_MODEL && findPricing(model) === null
+    );
+    const pricingStatus: PricingStatus =
+      this.pricedEvents === 0 ? 'unknown' : unknownModels.length > 0 ? 'partial' : 'exact-model-match';
 
-  const summary: ThreadPartSummary = {
-    threadId: finalThreadId,
-    title: partKind === 'main' ? title : null,
-    projectPath,
-    startedAt,
-    updatedAt,
-    primaryModel,
-    models: [...models],
-    ...totals,
-    estimatedApiCostUsd: pricedEvents > 0 ? totalCost : null,
-    pricingStatus,
-    sourceFile,
-    partKind,
-    userMessageCount: partKind === 'main' ? userMessageCount : 0,
-    source,
-    sourceLabel
-  };
+    const summary: ThreadPartSummary = {
+      threadId: finalThreadId,
+      partId: this.partId,
+      title: this.partKind === 'main' ? this.title : null,
+      projectPath: this.projectPath,
+      startedAt: this.startedAt,
+      updatedAt: this.updatedAt,
+      primaryModel,
+      models: [...this.models],
+      ...this.totals,
+      estimatedApiCostUsd: this.pricedEvents > 0 ? this.totalCost : null,
+      pricingStatus,
+      sourceFile: this.sourceFile,
+      partKind: this.partKind,
+      userMessageCount: this.partKind === 'main' ? this.userMessageCount : 0,
+      source: this.source,
+      sourceLabel: this.sourceLabel
+    };
 
-  return { summary, events, prompts, limits };
+    return { summary, events: this.events, prompts: this.prompts, limits: this.limits };
+  }
+
+  async finish(): Promise<ParseOutput> {
+    const parsed = this.result();
+    return { parts: parsed ? [parsed] : null };
+  }
+}
+
+/** Parse a whole Codex rollout file. */
+export async function parseSessionFile(sourceFile: string): Promise<ParsedSession | null> {
+  const parser = new CodexRolloutParser(sourceFile);
+  await feedFile(sourceFile, 0, parser);
+  return parser.result();
 }
 
 export function codexHomeDirectory(): string {
   return path.resolve(process.env.CODEX_HOME || path.join(os.homedir(), '.codex'));
 }
 
-export async function scanCodexSessions(store: UsageStore): Promise<ScanResult> {
-  const codexHome = codexHomeDirectory();
+function isInside(root: string, file: string): boolean {
+  const relative = path.relative(root, file);
+  return relative !== '' && !relative.startsWith('..') && !path.isAbsolute(relative);
+}
+
+/** Rollouts under `sessions/` and `archived_sessions/` in CODEX_HOME. */
+export function codexSessionSource(codexHome = codexHomeDirectory()): SessionSource {
   const roots = [path.join(codexHome, 'sessions'), path.join(codexHome, 'archived_sessions')];
-  const files = (
-    await Promise.all(roots.map((root) => listFilesRecursive(root, (_full, name) => name.endsWith('.jsonl'))))
-  ).flat();
-  return scanSessionFiles({
-    store,
-    files,
-    parserVersion: '6',
-    markerPath: path.resolve(process.cwd(), 'data', '.session-parser-version'),
+  return {
     label: 'Codex',
-    parse: async (sourceFile) => {
-      const parsed = await parseSessionFile(sourceFile);
-      return parsed ? [parsed] : null;
-    }
-  });
+    parserVersion: CODEX_PARSER_VERSION,
+    listFiles: async () => (
+      await Promise.all(roots.map((root) => listFilesRecursive(root, (_full, name) => name.endsWith('.jsonl'))))
+    ).flat(),
+    watchRoots: () => roots,
+    accepts: (file) => file.endsWith('.jsonl') && roots.some((root) => isInside(root, file)),
+    createParser: (file, state) => new CodexRolloutParser(file, codexPartId(file), state),
+    candidatePartIds: (file) => [codexPartId(file)]
+  };
+}
+
+export async function scanCodexSessions(store: UsageStore, codexHome?: string): Promise<ScanResult> {
+  return scanAllSessions(store, codexSessionSource(codexHome));
 }

@@ -55,9 +55,27 @@ test('stores per-provider parts with cache writes and provider-reported cost', (
         estimatedApiCostUsd: 0.5
       }
     ], [], { modifiedMs: 1, sizeBytes: 1 });
+    // Thread totals are summed from the stored events, so the subagent part's
+    // tokens come from its event rather than from the part summary.
     store.replaceThreadData(
       summary({ sourceFile: 'C:\\transcripts\\thread-1.jsonl#sidechain', partKind: 'subagent', title: null, userMessageCount: 0, reportedCostUsd: null, totalTokens: 300, inputTokens: 250, outputTokens: 50, cachedInputTokens: 0, cacheWriteInputTokens: 0, cacheWrite1hInputTokens: 0 }),
-      [],
+      [
+        {
+          eventKey: 'e2',
+          threadId: 'thread-1',
+          sourceFile: 'C:\\transcripts\\thread-1.jsonl#sidechain',
+          observedAt: 1_600,
+          model: 'claude-fable-5-1',
+          inputTokens: 250,
+          cachedInputTokens: 0,
+          cacheWriteInputTokens: 0,
+          cacheWrite1hInputTokens: 0,
+          outputTokens: 50,
+          reasoningOutputTokens: 0,
+          totalTokens: 300,
+          estimatedApiCostUsd: 0.1
+        }
+      ],
       [],
       { modifiedMs: 1, sizeBytes: 1 }
     );
@@ -85,8 +103,8 @@ test('stores per-provider parts with cache writes and provider-reported cost', (
     assert.equal(store.getTokenTotals().cacheWriteInputTokens, 200);
 
     const stats = store.getLocalAccountStats();
-    assert.equal(stats.lifetimeTokens, 1_100);
-    assert.equal(stats.peakDailyTokens, 1_100);
+    assert.equal(stats.lifetimeTokens, 1_400);
+    assert.equal(stats.peakDailyTokens, 1_400);
 
     store.insertRateLimitSnapshots([
       { key: 'claude:seven-day', label: '7-day window', usedPercent: 40, windowDurationMins: 10_080, resetsAt: 9_000, observedAt: 100 },

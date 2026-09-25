@@ -2,9 +2,18 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
-import type { StoredThreadEvent, UsageStore } from '../db.js';
+import type { StoredThreadEvent, ThreadMetadataInput, UsageStore } from '../db.js';
 import { estimateUsageCost, findPricing, normalizeModelName } from '../pricing.js';
-import { listFilesRecursive, scanSessionFiles, type ParsedSessionPart, type ScanResult } from '../sessionScan.js';
+import {
+  feedFile,
+  listFilesRecursive,
+  scanAllSessions,
+  type ParseOutput,
+  type ParsedSessionPart,
+  type ResumableParser,
+  type ScanResult,
+  type SessionSource
+} from '../sessionScan.js';
 import type {
   PricingStatus,
   PromptMetric,
@@ -20,7 +29,7 @@ type JsonRecord = Record<string, unknown>;
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 /** Bump when parsing changes so every transcript is indexed again. */
-export const CLAUDE_PARSER_VERSION = '3';
+export const CLAUDE_PARSER_VERSION = '4';
 
 function isRecord(value: unknown): value is JsonRecord {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -135,7 +144,32 @@ export function classifyClaudeEntrypoint(
   return { source, sourceLabel };
 }
 
+function pathSegments(filePath: string): string[] {
+  return filePath.split(/[\\/]/).filter(Boolean);
+}
+
+/**
+ * A transcript's path under Claude's `projects` folder (`<project>/<session>.jsonl`,
+ * or deeper for subagent files). It does not depend on where the config folder
+ * lives, so it identifies the part on every device and across migrations.
+ */
+export function claudePartId(sourceFile: string): string {
+  const segments = pathSegments(sourceFile);
+  const index = segments.lastIndexOf('projects');
+  const relative = index >= 0 && index < segments.length - 1 ? segments.slice(index + 1) : segments.slice(-1);
+  return relative.join('/');
+}
+
+/** Part id for a row written before multi-device tracking (keyed by path). */
+export function claudeLegacyPartId(sourceFile: string): string {
+  return sourceFile.endsWith('#sidechain')
+    ? `${claudePartId(sourceFile.slice(0, -'#sidechain'.length))}#sidechain`
+    : claudePartId(sourceFile);
+}
+
 interface PromptAccumulator extends PromptMetric {
+  /** Line the prompt started on; with the thread id it identifies the prompt. */
+  line: number;
   firstTokenAt: number | null;
   modelTokens: Map<string, number>;
   totalCost: number;
@@ -143,16 +177,41 @@ interface PromptAccumulator extends PromptMetric {
   hasUnpriced: boolean;
 }
 
+type SerializedPrompt = Omit<PromptAccumulator, 'modelTokens'> & { modelTokens: Array<[string, number]> };
+
+interface PartState {
+  totals: TokenUsage;
+  modelTokens: Array<[string, number]>;
+  models: string[];
+  seenMessageIds: string[];
+  totalCost: number;
+  pricedEvents: number;
+  eventCount: number;
+  startedAt: number | null;
+  updatedAt: number | null;
+  firstPrompt: string | null;
+  userMessageCount: number;
+  promptSequence: number;
+  promptsInTurn: number;
+  activePrompt: SerializedPrompt | null;
+  lastEventAt: number | null;
+}
+
+type PendingEvent = StoredThreadEvent & { messageId: string };
+
 /** Everything gathered for one session part (main conversation or subagent work). */
 class PartAccumulator {
-  readonly events: StoredThreadEvent[] = [];
-  readonly prompts: PromptMetric[] = [];
-  readonly totals = defaultUsage();
+  /** Produced since the parser was created or restored. */
+  readonly events: PendingEvent[] = [];
+  readonly prompts: Array<{ metric: PromptMetric; line: number }> = [];
+  totals = defaultUsage();
   readonly modelTokens = new Map<string, number>();
   readonly models = new Set<string>();
+  /** Streaming writes one record per content block; only the first counts. */
   readonly seenMessageIds = new Set<string>();
   totalCost = 0;
   pricedEvents = 0;
+  eventCount = 0;
   startedAt: number | null = null;
   updatedAt: number | null = null;
   firstPrompt: string | null = null;
@@ -164,13 +223,56 @@ class PartAccumulator {
 
   constructor(readonly sourceFile: string, readonly partKind: SessionPartKind) {}
 
+  toState(): PartState {
+    return {
+      totals: { ...this.totals },
+      modelTokens: [...this.modelTokens.entries()],
+      models: [...this.models],
+      seenMessageIds: [...this.seenMessageIds],
+      totalCost: this.totalCost,
+      pricedEvents: this.pricedEvents,
+      eventCount: this.eventCount,
+      startedAt: this.startedAt,
+      updatedAt: this.updatedAt,
+      firstPrompt: this.firstPrompt,
+      userMessageCount: this.userMessageCount,
+      promptSequence: this.promptSequence,
+      promptsInTurn: this.promptsInTurn,
+      activePrompt: this.activePrompt
+        ? { ...this.activePrompt, modelTokens: [...this.activePrompt.modelTokens.entries()] }
+        : null,
+      lastEventAt: this.lastEventAt
+    };
+  }
+
+  restore(state: PartState): void {
+    this.totals = { ...state.totals };
+    for (const [model, tokens] of state.modelTokens) this.modelTokens.set(model, tokens);
+    for (const model of state.models) this.models.add(model);
+    for (const id of state.seenMessageIds) this.seenMessageIds.add(id);
+    this.totalCost = state.totalCost;
+    this.pricedEvents = state.pricedEvents;
+    this.eventCount = state.eventCount;
+    this.startedAt = state.startedAt;
+    this.updatedAt = state.updatedAt;
+    this.firstPrompt = state.firstPrompt;
+    this.userMessageCount = state.userMessageCount;
+    this.promptSequence = state.promptSequence;
+    this.promptsInTurn = state.promptsInTurn;
+    this.activePrompt = state.activePrompt
+      ? { ...state.activePrompt, modelTokens: new Map(state.activePrompt.modelTokens) }
+      : null;
+    this.lastEventAt = state.lastEventAt;
+  }
+
   touch(timestamp: number): void {
     this.startedAt = this.startedAt === null ? timestamp : Math.min(this.startedAt, timestamp);
     this.updatedAt = this.updatedAt === null ? timestamp : Math.max(this.updatedAt, timestamp);
   }
 
+  /** Nothing ever indexed from this part (across every pass, not just this one). */
   get isEmpty(): boolean {
-    return this.events.length === 0 && this.prompts.length === 0;
+    return this.eventCount === 0 && this.promptSequence === 0;
   }
 
   startPrompt(prompt: string, timestamp: number | null, turnId: string | null, lineNumber: number): void {
@@ -180,7 +282,8 @@ class PartAccumulator {
     this.promptsInTurn = previousTurn !== null && previousTurn === turnId ? this.promptsInTurn + 1 : 1;
     const startedAt = timestamp ?? this.updatedAt ?? Math.floor(Date.now() / 1000);
     this.activePrompt = {
-      promptId: crypto.createHash('sha1').update(`${this.sourceFile}:${lineNumber}:${prompt}`).digest('hex'),
+      promptId: '',
+      line: lineNumber,
       sourceFile: this.sourceFile,
       threadId: '',
       turnId,
@@ -209,7 +312,8 @@ class PartAccumulator {
     this.lastEventAt = observedAt;
     const cost = estimateUsageCost(model, usage, observedAt);
     this.events.push({
-      eventKey: crypto.createHash('sha1').update(`${this.sourceFile}:${messageId}`).digest('hex'),
+      eventKey: '',
+      messageId,
       threadId: '',
       sourceFile: this.sourceFile,
       observedAt,
@@ -217,6 +321,7 @@ class PartAccumulator {
       ...usage,
       estimatedApiCostUsd: cost
     });
+    this.eventCount += 1;
     addUsage(this.totals, usage);
     this.models.add(model);
     this.modelTokens.set(model, (this.modelTokens.get(model) ?? 0) + usage.totalTokens);
@@ -264,6 +369,7 @@ class PartAccumulator {
     prompt.estimatedApiCostUsd = prompt.pricedEvents > 0 ? prompt.totalCost : null;
     prompt.pricingStatus = prompt.pricedEvents === 0 ? 'unknown' : prompt.hasUnpriced ? 'partial' : 'exact-model-match';
     const {
+      line,
       firstTokenAt: _firstTokenAt,
       modelTokens: _modelTokens,
       totalCost: _totalCost,
@@ -271,7 +377,7 @@ class PartAccumulator {
       hasUnpriced: _hasUnpriced,
       ...stored
     } = prompt;
-    this.prompts.push(stored);
+    this.prompts.push({ metric: stored, line });
   }
 
   primaryModel(): string {
@@ -282,6 +388,23 @@ class PartAccumulator {
     if (this.pricedEvents === 0) return 'unknown';
     const unknown = [...this.models].some((model) => findPricing(model) === null);
     return unknown ? 'partial' : 'exact-model-match';
+  }
+
+  /** Give this pass's events and prompts their final ids. */
+  assignIds(threadId: string): { events: StoredThreadEvent[]; prompts: PromptMetric[] } {
+    const events = this.events.map(({ messageId, ...event }) => ({
+      ...event,
+      threadId,
+      // The API message id is unique, so the same response keeps one id on
+      // every device and in every copy of the transcript.
+      eventKey: crypto.createHash('sha1').update(`claude:${threadId}:${messageId}`).digest('hex')
+    }));
+    const prompts = this.prompts.map(({ metric, line }) => ({
+      ...metric,
+      threadId,
+      promptId: crypto.createHash('sha1').update(`claude:${threadId}:${line}:${metric.prompt}`).digest('hex')
+    }));
+    return { events, prompts };
   }
 }
 
@@ -333,71 +456,161 @@ async function fileContainsAny(file: string, needles: string[]): Promise<boolean
   }
 }
 
+/** File-level fields of the saved parser state. */
+interface ClaudeParserState {
+  version: string;
+  lineNumber: number;
+  sessionId: string | null;
+  cwd: string | null;
+  gitBranch: string | null;
+  entrypoint: string | null;
+  sessionKind: string | null;
+  bridged: boolean;
+  aiTitle: string | null;
+  customTitle: string | null;
+  reportedCostUsd: number | null;
+  continuedInto: string | null;
+  lastUuid: string | null;
+  lastMessageId: string | null;
+  updatedAt: number | null;
+  effortCounts: Array<[string, number]>;
+  main: PartState;
+  side: PartState;
+}
+
 /**
- * Parse one Claude Code transcript into session parts. The main conversation
+ * Resumable parser for one Claude Code transcript. The main conversation
  * becomes a `main` part; sidechain records (subagents logged inline) become a
  * `subagent` part with the same thread id; files under `subagents/` are
  * subagent parts of their parent session.
  *
- * Returns `[]` when the file was continued into another session whose
- * transcript already contains every record of this one, so the copy is not
- * counted twice.
+ * A file that was continued into another session whose transcript already
+ * contains every record of this one is reported as superseded, so the copy is
+ * not counted twice.
  */
-export async function parseClaudeTranscript(sourceFile: string): Promise<ClaudeParsedPart[]> {
-  const parentSession = parentSessionFromPath(sourceFile);
-  const isSubagentFile = parentSession !== null || path.basename(sourceFile).startsWith('agent-');
-  const main = new PartAccumulator(sourceFile, isSubagentFile ? 'subagent' : 'main');
-  const side = new PartAccumulator(`${sourceFile}#sidechain`, 'subagent');
+export class ClaudeTranscriptParser implements ResumableParser {
+  private readonly parentSession: string | null;
+  private readonly isSubagentFile: boolean;
+  private readonly partId: string;
+  private readonly main: PartAccumulator;
+  private readonly side: PartAccumulator;
+  private lineNumber = 0;
+  private sessionId: string | null = null;
+  private cwd: string | null = null;
+  private gitBranch: string | null = null;
+  private entrypoint: string | null = null;
+  private sessionKind: string | null = null;
+  private bridged = false;
+  private aiTitle: string | null = null;
+  private customTitle: string | null = null;
+  private reportedCostUsd: number | null = null;
+  private continuedInto: string | null = null;
+  private lastUuid: string | null = null;
+  private lastMessageId: string | null = null;
+  private updatedAt: number | null = null;
+  private readonly effortCounts = new Map<string, number>();
 
-  const stream = fs.createReadStream(sourceFile, { encoding: 'utf8' });
-  const lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
+  constructor(readonly sourceFile: string, state?: unknown) {
+    this.parentSession = parentSessionFromPath(sourceFile);
+    this.isSubagentFile = this.parentSession !== null || path.basename(sourceFile).startsWith('agent-');
+    this.partId = claudePartId(sourceFile);
+    this.main = new PartAccumulator(sourceFile, this.isSubagentFile ? 'subagent' : 'main');
+    this.side = new PartAccumulator(`${sourceFile}#sidechain`, 'subagent');
+    if (state !== undefined) this.restore(state);
+  }
 
-  let lineNumber = 0;
-  let sessionId: string | null = null;
-  let cwd: string | null = null;
-  let gitBranch: string | null = null;
-  let entrypoint: string | null = null;
-  let sessionKind: string | null = null;
-  let bridged = false;
-  let aiTitle: string | null = null;
-  let customTitle: string | null = null;
-  let reportedCostUsd: number | null = null;
-  let continuedInto: string | null = null;
-  let lastUuid: string | null = null;
-  let lastMessageId: string | null = null;
-  let updatedAt: number | null = null;
-  const effortCounts = new Map<string, number>();
+  private restore(raw: unknown): void {
+    const state = raw as ClaudeParserState;
+    if (!state || typeof state !== 'object' || state.version !== CLAUDE_PARSER_VERSION) {
+      throw new Error('Saved Claude parser state is from another parser version');
+    }
+    this.lineNumber = state.lineNumber;
+    this.sessionId = state.sessionId;
+    this.cwd = state.cwd;
+    this.gitBranch = state.gitBranch;
+    this.entrypoint = state.entrypoint;
+    this.sessionKind = state.sessionKind;
+    this.bridged = state.bridged;
+    this.aiTitle = state.aiTitle;
+    this.customTitle = state.customTitle;
+    this.reportedCostUsd = state.reportedCostUsd;
+    this.continuedInto = state.continuedInto;
+    this.lastUuid = state.lastUuid;
+    this.lastMessageId = state.lastMessageId;
+    this.updatedAt = state.updatedAt;
+    for (const [effort, count] of state.effortCounts) this.effortCounts.set(effort, count);
+    this.main.restore(state.main);
+    this.side.restore(state.side);
+  }
 
-  for await (const line of lines) {
-    lineNumber += 1;
-    if (!line.trim()) continue;
+  snapshot(): ClaudeParserState {
+    return {
+      version: CLAUDE_PARSER_VERSION,
+      lineNumber: this.lineNumber,
+      sessionId: this.sessionId,
+      cwd: this.cwd,
+      gitBranch: this.gitBranch,
+      entrypoint: this.entrypoint,
+      sessionKind: this.sessionKind,
+      bridged: this.bridged,
+      aiTitle: this.aiTitle,
+      customTitle: this.customTitle,
+      reportedCostUsd: this.reportedCostUsd,
+      continuedInto: this.continuedInto,
+      lastUuid: this.lastUuid,
+      lastMessageId: this.lastMessageId,
+      updatedAt: this.updatedAt,
+      effortCounts: [...this.effortCounts.entries()],
+      main: this.main.toState(),
+      side: this.side.toState()
+    };
+  }
+
+  private threadId(): string {
+    const baseName = path.basename(this.sourceFile, '.jsonl');
+    return (
+      this.parentSession ??
+      (UUID_PATTERN.test(baseName) ? baseName : null) ??
+      this.sessionId ??
+      crypto.createHash('sha1').update(this.partId).digest('hex')
+    );
+  }
+
+  identity(): string {
+    return `${this.threadId()}|${this.main.partKind}`;
+  }
+
+  feed(line: string): void {
+    this.lineNumber += 1;
+    if (!line.trim()) return;
     let record: JsonRecord;
     try {
       const parsed = JSON.parse(line) as unknown;
-      if (!isRecord(parsed)) continue;
+      if (!isRecord(parsed)) return;
       record = parsed;
     } catch {
-      continue;
+      return;
     }
+    const { main, side } = this;
 
     const type = typeof record.type === 'string' ? record.type : '';
     const timestamp = parseTimestamp(record.timestamp);
-    const sidechain = !isSubagentFile && (record.isSidechain === true || typeof record.agentId === 'string');
+    const sidechain = !this.isSubagentFile && (record.isSidechain === true || typeof record.agentId === 'string');
     const part = sidechain ? side : main;
     if (timestamp !== null) {
       part.touch(timestamp);
-      updatedAt = updatedAt === null ? timestamp : Math.max(updatedAt, timestamp);
+      this.updatedAt = this.updatedAt === null ? timestamp : Math.max(this.updatedAt, timestamp);
     }
     // Records written after the continuation marker were never copied, so the
     // last uuid before it is what the continuation file must contain.
-    if (typeof record.uuid === 'string' && continuedInto === null) lastUuid = record.uuid;
+    if (typeof record.uuid === 'string' && this.continuedInto === null) this.lastUuid = record.uuid;
     if (!sidechain) {
-      sessionId ??= text(record.sessionId, 100);
-      cwd ??= text(record.cwd, 500);
+      this.sessionId ??= text(record.sessionId, 100);
+      this.cwd ??= text(record.cwd, 500);
       const branch = text(record.gitBranch, 200);
-      if (branch && branch !== 'HEAD') gitBranch = branch;
-      entrypoint ??= text(record.entrypoint, 60);
-      if (record.sessionKind === 'bg') sessionKind = 'bg';
+      if (branch && branch !== 'HEAD') this.gitBranch = branch;
+      this.entrypoint ??= text(record.entrypoint, 60);
+      if (record.sessionKind === 'bg') this.sessionKind = 'bg';
     }
 
     switch (type) {
@@ -410,7 +623,7 @@ export async function parseClaudeTranscript(sourceFile: string): Promise<ClaudeP
         const cleaned = cleanClaudePrompt(raw);
         if (!cleaned) break;
         const turnId = text(record.promptId, 100) ?? text(record.uuid, 100);
-        part.startPrompt(cleaned, timestamp, turnId, lineNumber);
+        part.startPrompt(cleaned, timestamp, turnId, this.lineNumber);
         break;
       }
       case 'assistant': {
@@ -422,7 +635,9 @@ export async function parseClaudeTranscript(sourceFile: string): Promise<ClaudeP
         const model = normalizeModelName(rawModel);
         const messageId = text(message.id, 120) ?? text(record.requestId, 120) ?? text(record.uuid, 120);
         if (!messageId || part.seenMessageIds.has(messageId)) break;
-        if (continuedInto === null && !sidechain && typeof message.id === 'string') lastMessageId = message.id;
+        if (this.continuedInto === null && !sidechain && typeof message.id === 'string') {
+          this.lastMessageId = message.id;
+        }
         // Streaming writes one record per content block, all carrying the full usage.
         const usage = usageFromClaudeMessage(message.usage);
         if (!usage) {
@@ -431,7 +646,7 @@ export async function parseClaudeTranscript(sourceFile: string): Promise<ClaudeP
         }
         part.addEvent(timestamp ?? part.updatedAt ?? Math.floor(Date.now() / 1000), model, usage, messageId);
         if (!sidechain && typeof record.effort === 'string') {
-          effortCounts.set(record.effort, (effortCounts.get(record.effort) ?? 0) + 1);
+          this.effortCounts.set(record.effort, (this.effortCounts.get(record.effort) ?? 0) + 1);
         }
         break;
       }
@@ -442,104 +657,145 @@ export async function parseClaudeTranscript(sourceFile: string): Promise<ClaudeP
         break;
       }
       case 'ai-title':
-        aiTitle = text(record.aiTitle, 200) ?? aiTitle;
+        this.aiTitle = text(record.aiTitle, 200) ?? this.aiTitle;
         break;
       case 'custom-title':
-        customTitle = text(record.customTitle, 200) ?? customTitle;
+        this.customTitle = text(record.customTitle, 200) ?? this.customTitle;
         break;
       case 'cost-state': {
         const cost = toFiniteNumber(record.totalCostUSD);
-        if (cost !== null && cost > 0) reportedCostUsd = cost;
+        if (cost !== null && cost > 0) this.reportedCostUsd = cost;
         break;
       }
       case 'continued-in':
-        continuedInto = text(record.continuedInSessionId, 100);
+        this.continuedInto = text(record.continuedInSessionId, 100);
         break;
       case 'bridge-session':
-        bridged = true;
+        this.bridged = true;
         break;
       default:
         break;
     }
   }
 
-  main.finalizePrompt(main.updatedAt, null);
-  side.finalizePrompt(side.updatedAt, null);
+  private continuationPath(): string | null {
+    if (!this.continuedInto) return null;
+    const continuation = path.join(path.dirname(this.sourceFile), `${this.continuedInto}.jsonl`);
+    return continuation === this.sourceFile ? null : continuation;
+  }
 
-  if (continuedInto && (lastMessageId || lastUuid)) {
-    const continuation = path.join(path.dirname(sourceFile), `${continuedInto}.jsonl`);
-    if (continuation !== sourceFile && fs.existsSync(continuation)) {
-      // The copy keeps API message ids even where it rewrites record uuids, so the
-      // last assistant message is the reliable marker; the last uuid is a fallback.
-      const needles = [
-        ...(lastMessageId ? [`"id":"${lastMessageId}"`] : []),
-        ...(lastUuid ? [`"uuid":"${lastUuid}"`] : [])
-      ];
-      try {
-        if (await fileContainsAny(continuation, needles)) return [];
-      } catch {
-        // If the continuation cannot be read, keep this file's data.
-      }
+  private async superseded(): Promise<boolean> {
+    const continuation = this.continuationPath();
+    if (!continuation || !(this.lastMessageId || this.lastUuid) || !fs.existsSync(continuation)) return false;
+    // The copy keeps API message ids even where it rewrites record uuids, so the
+    // last assistant message is the reliable marker; the last uuid is a fallback.
+    const needles = [
+      ...(this.lastMessageId ? [`"id":"${this.lastMessageId}"`] : []),
+      ...(this.lastUuid ? [`"uuid":"${this.lastUuid}"`] : [])
+    ];
+    try {
+      return await fileContainsAny(continuation, needles);
+    } catch {
+      // If the continuation cannot be read, keep this file's data.
+      return false;
     }
   }
 
-  if (main.isEmpty && side.isEmpty) return [];
+  /**
+   * Parts as of the last line fed. `[]` when the file is superseded or has
+   * nothing to index (see `finish()` for the distinction).
+   */
+  async parts(): Promise<{ parts: ClaudeParsedPart[]; superseded: boolean }> {
+    const { main, side } = this;
+    main.finalizePrompt(main.updatedAt, null);
+    side.finalizePrompt(side.updatedAt, null);
+    if (await this.superseded()) return { parts: [], superseded: true };
+    if (main.isEmpty && side.isEmpty) return { parts: [], superseded: false };
 
-  const baseName = path.basename(sourceFile, '.jsonl');
-  const threadId =
-    parentSession ??
-    (UUID_PATTERN.test(baseName) ? baseName : null) ??
-    sessionId ??
-    crypto.createHash('sha1').update(sourceFile).digest('hex');
-  const classified = classifyClaudeEntrypoint(entrypoint, sessionKind, bridged);
-  const source: ThreadSource = isSubagentFile ? 'subagent' : classified.source;
-  const sourceLabel = isSubagentFile ? null : classified.sourceLabel;
-  const reasoningEffort = [...effortCounts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? null;
+    const threadId = this.threadId();
+    const classified = classifyClaudeEntrypoint(this.entrypoint, this.sessionKind, this.bridged);
+    const source: ThreadSource = this.isSubagentFile ? 'subagent' : classified.source;
+    const sourceLabel = this.isSubagentFile ? null : classified.sourceLabel;
+    const reasoningEffort = [...this.effortCounts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? null;
 
-  const parts: ClaudeParsedPart[] = [];
-  const buildSummary = (part: PartAccumulator, kind: SessionPartKind): ThreadPartSummary => ({
-    threadId,
-    title: kind === 'main' ? part.firstPrompt : null,
-    projectPath: cwd,
-    startedAt: part.startedAt,
-    updatedAt: part.updatedAt,
-    primaryModel: part.primaryModel(),
-    models: [...part.models],
-    ...part.totals,
-    estimatedApiCostUsd: part.pricedEvents > 0 ? part.totalCost : null,
-    pricingStatus: part.pricingStatus(),
-    sourceFile: part.sourceFile,
-    partKind: kind,
-    userMessageCount: kind === 'main' ? part.userMessageCount : 0,
-    source: kind === 'main' ? source : 'subagent',
-    sourceLabel: kind === 'main' ? sourceLabel : null,
-    reportedCostUsd: kind === 'main' ? reportedCostUsd : null
-  });
+    const parts: ClaudeParsedPart[] = [];
+    const buildSummary = (part: PartAccumulator, kind: SessionPartKind, partId: string): ThreadPartSummary => ({
+      threadId,
+      partId,
+      title: kind === 'main' ? part.firstPrompt : null,
+      projectPath: this.cwd,
+      startedAt: part.startedAt,
+      updatedAt: part.updatedAt,
+      primaryModel: part.primaryModel(),
+      models: [...part.models],
+      ...part.totals,
+      estimatedApiCostUsd: part.pricedEvents > 0 ? part.totalCost : null,
+      pricingStatus: part.pricingStatus(),
+      sourceFile: part.sourceFile,
+      partKind: kind,
+      userMessageCount: kind === 'main' ? part.userMessageCount : 0,
+      source: kind === 'main' ? source : 'subagent',
+      sourceLabel: kind === 'main' ? sourceLabel : null,
+      reportedCostUsd: kind === 'main' ? this.reportedCostUsd : null
+    });
 
-  if (!main.isEmpty) {
-    for (const event of main.events) event.threadId = threadId;
-    for (const prompt of main.prompts) prompt.threadId = threadId;
-    const summary = buildSummary(main, main.partKind);
-    const metadata: ClaudeThreadMetadata | undefined = main.partKind === 'main'
-      ? {
-          threadId,
-          displayName: customTitle ?? aiTitle,
-          updatedAt: updatedAt ?? Math.floor(Date.now() / 1000),
-          source,
-          sourceLabel,
-          model: summary.primaryModel === 'unknown' ? null : summary.primaryModel,
-          reasoningEffort,
-          gitBranch,
-          projectName: projectNameFromPath(cwd)
-        }
-      : undefined;
-    parts.push({ summary, events: main.events, prompts: main.prompts, metadata });
+    if (!main.isEmpty) {
+      const { events, prompts } = main.assignIds(threadId);
+      const summary = buildSummary(main, main.partKind, this.partId);
+      const metadata: ClaudeThreadMetadata | undefined = main.partKind === 'main'
+        ? {
+            threadId,
+            displayName: this.customTitle ?? this.aiTitle,
+            updatedAt: this.updatedAt ?? Math.floor(Date.now() / 1000),
+            source,
+            sourceLabel,
+            model: summary.primaryModel === 'unknown' ? null : summary.primaryModel,
+            reasoningEffort,
+            gitBranch: this.gitBranch,
+            projectName: projectNameFromPath(this.cwd)
+          }
+        : undefined;
+      parts.push({ summary, events, prompts, metadata });
+    }
+    if (!side.isEmpty) {
+      const { events } = side.assignIds(threadId);
+      parts.push({ summary: buildSummary(side, 'subagent', `${this.partId}#sidechain`), events, prompts: [] });
+    }
+    return { parts, superseded: false };
   }
-  if (!side.isEmpty) {
-    for (const event of side.events) event.threadId = threadId;
-    parts.push({ summary: buildSummary(side, 'subagent'), events: side.events, prompts: [] });
+
+  async finish(): Promise<ParseOutput> {
+    const { parts, superseded } = await this.parts();
+    const metadata: ThreadMetadataInput[] = parts.flatMap((part) => (part.metadata
+      ? [{
+          threadId: part.metadata.threadId,
+          displayName: part.metadata.displayName,
+          preview: null,
+          updatedAt: part.metadata.updatedAt,
+          source: part.metadata.source,
+          sourceLabel: part.metadata.sourceLabel,
+          model: part.metadata.model,
+          reasoningEffort: part.metadata.reasoningEffort,
+          gitBranch: part.metadata.gitBranch,
+          projectName: part.metadata.projectName
+        }]
+      : []));
+    return {
+      parts: superseded ? [] : parts.length === 0 ? null : parts,
+      metadata,
+      dependsOn: this.continuationPath()
+    };
   }
-  return parts;
+}
+
+/**
+ * Parse a whole transcript. Returns `[]` when the file is superseded by its
+ * continuation or has nothing to index.
+ */
+export async function parseClaudeTranscript(sourceFile: string): Promise<ClaudeParsedPart[]> {
+  const parser = new ClaudeTranscriptParser(sourceFile);
+  await feedFile(sourceFile, 0, parser);
+  return (await parser.parts()).parts;
 }
 
 const SKIPPED_DIRECTORIES = new Set(['memory', 'tool-results', 'file-history']);
@@ -552,32 +808,24 @@ export async function listClaudeTranscripts(root = claudeProjectsDir()): Promise
   );
 }
 
-export async function scanClaudeSessions(store: UsageStore, root = claudeProjectsDir()): Promise<ScanResult> {
-  const files = await listClaudeTranscripts(root);
-  return scanSessionFiles({
-    store,
-    files,
-    parserVersion: CLAUDE_PARSER_VERSION,
-    markerPath: path.resolve(process.cwd(), 'data', '.claude-parser-version'),
+/** Transcripts under `<CLAUDE_CONFIG_DIR>/projects`. */
+export function claudeSessionSource(root = claudeProjectsDir()): SessionSource {
+  return {
     label: 'Claude Code',
-    parse: async (sourceFile) => {
-      const parts = await parseClaudeTranscript(sourceFile);
-      const metadata = parts.flatMap((part) => (part.metadata ? [part.metadata] : []));
-      if (metadata.length > 0) {
-        store.upsertThreadMetadata(metadata.map((item) => ({
-          threadId: item.threadId,
-          displayName: item.displayName,
-          preview: null,
-          updatedAt: item.updatedAt,
-          source: item.source,
-          sourceLabel: item.sourceLabel,
-          model: item.model,
-          reasoningEffort: item.reasoningEffort,
-          gitBranch: item.gitBranch,
-          projectName: item.projectName
-        })));
-      }
-      return parts;
-    }
-  });
+    parserVersion: CLAUDE_PARSER_VERSION,
+    listFiles: () => listClaudeTranscripts(root),
+    watchRoots: () => [root],
+    accepts: (file) => {
+      if (!file.endsWith('.jsonl')) return false;
+      const relative = path.relative(root, file);
+      if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) return false;
+      return !pathSegments(relative).some((segment) => SKIPPED_DIRECTORIES.has(segment));
+    },
+    createParser: (file, state) => new ClaudeTranscriptParser(file, state),
+    candidatePartIds: (file) => [claudePartId(file), `${claudePartId(file)}#sidechain`]
+  };
+}
+
+export async function scanClaudeSessions(store: UsageStore, root = claudeProjectsDir()): Promise<ScanResult> {
+  return scanAllSessions(store, claudeSessionSource(root));
 }

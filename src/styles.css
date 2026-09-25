@@ -1960,3 +1960,349 @@ a {
     grid-template-columns: minmax(0, 1fr);
   }
 }
+
+/* ------------------------------------------------------------------
+   Devices (topbar popover)
+   ------------------------------------------------------------------ */
+.device-menu {
+  position: relative;
+}
+
+.device-pill {
+  cursor: pointer;
+  transition: border-color 160ms var(--ease);
+}
+
+.device-pill:hover {
+  border-color: var(--line);
+}
+
+.device-pill.attention i {
+  background: #bf7b1f;
+  box-shadow: 0 0 0 3px var(--amber-tint);
+}
+
+.device-popover {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: calc(var(--z-topbar) + 1);
+  width: min(380px, calc(100vw - 32px));
+  padding: 14px 16px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  color: var(--ink);
+  font-size: 12.5px;
+}
+
+.device-popover header strong {
+  display: block;
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.device-popover header span {
+  display: block;
+  margin-top: 1px;
+  color: var(--ink-2);
+}
+
+.device-popover ul {
+  margin-top: 10px;
+  border-top: 1px solid var(--line-soft);
+}
+
+.device-popover li {
+  display: grid;
+  grid-template-columns: 10px minmax(0, 1fr);
+  gap: 4px 10px;
+  align-items: start;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.device-dot {
+  width: 7px;
+  height: 7px;
+  margin-top: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+.device-dot.offline {
+  background: var(--ink-3);
+}
+
+.device-main {
+  display: grid;
+  min-width: 0;
+}
+
+.device-main strong {
+  overflow: hidden;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.device-main em {
+  margin-left: 6px;
+  color: var(--ink-3);
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 500;
+}
+
+.device-main span {
+  color: var(--ink-2);
+}
+
+.device-main .device-warning {
+  margin-top: 2px;
+  color: #8a5a17;
+}
+
+.device-popover dl {
+  grid-column: 2;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 16px;
+}
+
+.device-popover dl div {
+  display: flex;
+  gap: 5px;
+}
+
+.device-popover dt {
+  color: var(--ink-3);
+}
+
+.device-popover dd {
+  font-variant-numeric: tabular-nums;
+  font-weight: 500;
+}
+
+.device-foot {
+  margin-top: 10px;
+  color: var(--ink-2);
+  text-wrap: pretty;
+}
+
+.device-tag {
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--accent-tint);
+  color: var(--accent-strong);
+  font-size: 10.5px;
+  font-weight: 600;
+}
+
+.provisional-tag {
+  display: inline-block;
+  padding: 1px 7px;
+  border-radius: 4px;
+  background: var(--amber-tint);
+  color: #7a5215;
+  font-size: 11.5px;
+  font-weight: 600;
+  cursor: help;
+}
+
+/* ------------------------------------------------------------------
+   Window explorer (current and past quota windows)
+   ------------------------------------------------------------------ */
+.window-explorer-head {
+  flex-wrap: wrap;
+}
+
+.window-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.window-nav {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.window-nav .select-field select {
+  max-width: 290px;
+}
+
+.window-summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(118px, 1fr));
+  gap: 10px 18px;
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line-soft);
+}
+
+.window-summary dt {
+  color: var(--ink-2);
+  font-size: 11.5px;
+}
+
+.window-summary dd {
+  margin-top: 1px;
+  font-size: 14px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.window-summary dd small {
+  display: block;
+  color: var(--ink-3);
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.window-summary-devices {
+  grid-column: span 2;
+}
+
+.window-summary-devices dd {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 12px;
+  font-weight: 500;
+}
+
+.window-summary-devices b {
+  font-weight: 600;
+}
+
+.window-sessions {
+  margin-top: 16px;
+  border-top: 1px solid var(--line-soft);
+}
+
+.window-session {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(90px, 150px) 84px 76px 76px;
+  gap: 12px;
+  align-items: center;
+  padding: 9px 2px;
+  border-bottom: 1px solid var(--line-soft);
+  font-size: 13px;
+}
+
+.window-session-header {
+  padding-top: 10px;
+  padding-bottom: 8px;
+  color: var(--ink-3);
+  font-size: 11.5px;
+  font-weight: 500;
+}
+
+.window-session .num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.window-session .num strong {
+  display: block;
+  font-weight: 600;
+}
+
+.window-session .num small {
+  display: block;
+  color: var(--ink-3);
+  font-size: 11px;
+}
+
+.window-session-main {
+  min-width: 0;
+}
+
+.window-session-main > button {
+  max-width: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  text-align: left;
+}
+
+.window-session-main > button:hover .window-session-title span {
+  color: var(--accent-strong);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.window-session-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  font-weight: 500;
+}
+
+.window-session-title span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.window-session-model {
+  overflow: hidden;
+  color: var(--ink-2);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.window-sessions-more {
+  margin-top: 8px;
+  padding: 4px 0;
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  font-size: 12.5px;
+  font-weight: 500;
+}
+
+.window-sessions-more:hover {
+  color: var(--accent-strong);
+  text-decoration: underline;
+}
+
+@media (max-width: 960px) {
+  .window-session {
+    grid-template-columns: minmax(0, 1fr) 76px 70px;
+  }
+
+  .window-session-model,
+  .window-session > .num:last-child {
+    display: none;
+  }
+}
+
+@media (max-width: 640px) {
+  .window-controls,
+  .window-nav {
+    width: 100%;
+  }
+
+  .window-nav .select-field {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+
+  .window-nav .select-field select {
+    width: 100%;
+    max-width: none;
+  }
+
+  .window-summary-devices {
+    grid-column: auto;
+  }
+
+  .device-menu {
+    display: none;
+  }
+}

@@ -11,9 +11,17 @@ import {
 import { listCloudTasks } from '../cloudTasks.js';
 import { createUsageStore, type ThreadMetadataInput, type UsageStore } from '../db.js';
 import { buildProviderOverview } from '../overview.js';
-import { debugEnabled, type Provider } from '../providers.js';
-import { scanCodexSessions } from '../sessionLogs.js';
+import {
+  SCAN_MARGIN_SECONDS,
+  debugEnabled,
+  standaloneRuntime,
+  type Provider,
+  type ProviderRuntime
+} from '../providers.js';
+import { createSessionScanner } from '../sessionScan.js';
+import { codexPartId, codexSessionSource } from '../sessionLogs.js';
 import type { CloudTaskStatus, DashboardOverview, RateLimitWindow } from '../types.js';
+import { listWindows, windowDetail } from '../windows.js';
 
 export interface CodexProviderConfig {
   enabled: boolean;
@@ -23,9 +31,14 @@ export interface CodexProviderConfig {
   threadMetadataPollMs: number;
   cloudTaskPollMs: number;
   cloudTasksEnabled: boolean;
+  /** Role, device, and polling switches; single-machine defaults when omitted. */
+  runtime?: ProviderRuntime;
   /** Override the store, mainly for tests. */
   store?: UsageStore;
 }
+
+/** Local chat names are re-read at most this often after change-driven scans. */
+const TARGETED_METADATA_INTERVAL_MS = 30_000;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -56,8 +69,33 @@ function firstText(record: Record<string, unknown>, keys: string[]): string | nu
  * cloud tasks from the CLI.
  */
 export function createCodexProvider(config: CodexProviderConfig): Provider {
-  const store = config.store ?? createUsageStore({ file: 'codex-usage.sqlite', provider: 'codex' });
+  const runtime = config.runtime ?? standaloneRuntime();
+  const store = config.store ?? createUsageStore({
+    file: 'codex-usage.sqlite',
+    provider: 'codex',
+    dataDir: runtime.dataDir,
+    deviceId: runtime.deviceId,
+    outbox: runtime.outbox,
+    legacyPartId: (row) => codexPartId(row.sourceFile)
+  });
   const codex = new AppServerClient();
+  let lastLocalMetadataRefresh = 0;
+  const scanner = createSessionScanner({
+    store,
+    source: codexSessionSource(),
+    watch: runtime.watchSessions,
+    onScanned: (result, kind) => {
+      // Chat names live in the desktop state database, which changes with the logs.
+      if (kind === 'full' || Date.now() - lastLocalMetadataRefresh >= TARGETED_METADATA_INTERVAL_MS) {
+        refreshLocalMetadata();
+      }
+      if (debugEnabled() && (kind === 'full' || result.updated > 0)) {
+        console.log(
+          `Codex ${kind} scan: ${result.scanned} files, ${result.incremental} resumed, ${result.full} parsed in full, ${result.errors} errors`
+        );
+      }
+    }
+  });
   let limits: RateLimitWindow[] = [];
   let accountState: { authType: string | null; planType: string | null } = {
     authType: null,
@@ -76,7 +114,6 @@ export function createCodexProvider(config: CodexProviderConfig): Provider {
   };
   let connectionError: string | null = null;
   let refreshInProgress: Promise<void> | null = null;
-  let sessionRefreshInProgress: Promise<void> | null = null;
   let cloudRefreshInProgress: Promise<void> | null = null;
   let lastAccountUsageRefresh = 0;
   let lastThreadMetadataRefresh = 0;
@@ -218,25 +255,22 @@ export function createCodexProvider(config: CodexProviderConfig): Provider {
     return refreshInProgress;
   }
 
+  function refreshLocalMetadata(): void {
+    lastLocalMetadataRefresh = Date.now();
+    try {
+      const local = localMetadataInputs();
+      if (local.length > 0) store.upsertThreadMetadata(local);
+    } catch (error) {
+      console.warn('Codex chat names unavailable:', (error as Error).message);
+    }
+  }
+
   async function refreshSessions(): Promise<void> {
-    if (sessionRefreshInProgress) return sessionRefreshInProgress;
-
-    sessionRefreshInProgress = (async () => {
-      try {
-        const result = await scanCodexSessions(store);
-        const local = localMetadataInputs();
-        if (local.length > 0) store.upsertThreadMetadata(local);
-        if (debugEnabled()) {
-          console.log(`Codex session scan: ${result.scanned} found, ${result.updated} updated, ${result.errors} errors`);
-        }
-      } catch (error) {
-        console.warn('Codex session scan failed:', (error as Error).message);
-      }
-    })().finally(() => {
-      sessionRefreshInProgress = null;
-    });
-
-    return sessionRefreshInProgress;
+    try {
+      await scanner.fullScan();
+    } catch (error) {
+      console.warn('Codex session scan failed:', (error as Error).message);
+    }
   }
 
   async function refreshCloudTasks(): Promise<void> {
@@ -298,42 +332,68 @@ export function createCodexProvider(config: CodexProviderConfig): Provider {
         checkedAt: cloudTasksCheckedAt,
         tasks: store.getCloudTasks(20)
       },
+      sync: runtime.sync('codex'),
       notices,
       emptyThreadsNotice:
         'No local session token events were found. Check CODEX_HOME or create a new Codex thread, then refresh.'
     });
   }
 
+  function windowContext() {
+    return { settledThrough: runtime.sync('codex').settledThrough };
+  }
+
   return {
     id: 'codex',
     label: 'Codex',
     enabled: config.enabled,
+    store,
     start() {
       if (started || !config.enabled) return;
       started = true;
-      void refreshCodexData(true);
       void refreshSessions();
-      void refreshCloudTasks();
-      timers.push(
-        setInterval(() => void refreshCodexData(false), config.rateLimitPollMs),
-        setInterval(() => void refreshSessions(), config.sessionScanMs),
-        setInterval(() => void refreshCloudTasks(), config.cloudTaskPollMs)
-      );
+      timers.push(setInterval(() => void refreshSessions(), config.sessionScanMs));
+      // Account quota and cloud tasks are account-wide: only the central
+      // machine polls them, so devices do not all ask for the same numbers.
+      if (runtime.pollAccount) {
+        void refreshCodexData(true);
+        void refreshCloudTasks();
+        timers.push(
+          setInterval(() => void refreshCodexData(false), config.rateLimitPollMs),
+          setInterval(() => void refreshCloudTasks(), config.cloudTaskPollMs)
+        );
+      }
       for (const timer of timers) timer.unref();
     },
     stop() {
       for (const timer of timers) clearInterval(timer);
       timers.length = 0;
+      scanner.stop();
       codex.stop();
     },
     async refresh() {
       if (!config.enabled) return;
+      if (!runtime.pollAccount) {
+        await refreshSessions();
+        return;
+      }
       lastThreadMetadataRefresh = 0;
       await Promise.all([refreshCodexData(true), refreshSessions(), refreshCloudTasks()]);
     },
     overview,
     health() {
       return { connected: codex.connected && !connectionError, error: connectionError };
-    }
+    },
+    windows(durationMins) {
+      return listWindows(store, durationMins, undefined, pickWindow(durationMins), windowContext());
+    },
+    windowDetail(durationMins, resetsAt) {
+      return windowDetail(store, durationMins, undefined, resetsAt, pickWindow(durationMins), windowContext());
+    },
+    scannedThrough() {
+      const startedAt = scanner.lastFullScanStartedAt();
+      return startedAt === null ? null : startedAt - SCAN_MARGIN_SECONDS;
+    },
+    watching: () => scanner.watching()
   };
 }
