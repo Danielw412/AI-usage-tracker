@@ -78,7 +78,7 @@ http://localhost:8893
 powershell -ExecutionPolicy Bypass -File scripts\install-autostart.ps1
 ```
 
-This registers the `AI Usage Tracker` scheduled task, which runs `scripts\start-ai-usage-tracker.ps1` at every sign-in, and starts it right away. Rerun it whenever a script is renamed or moved; it also removes the old `Codex Usage Dashboard` task. To restart the tracker after a build, run `Start-ScheduledTask -TaskName "AI Usage Tracker"`; the start script replaces whatever tracker is already holding the port.
+This registers the `AI Usage Tracker` scheduled task, which runs `scripts\start-ai-usage-tracker.ps1` at every sign-in, and starts it right away. The same task runs whatever role `.env` selects, so on a laptop set up as a [collector](#2-set-up-a-collector-windows-laptop) it starts the collector. No administrator shell is needed. Rerun it whenever a script is renamed or moved; it also removes the old `Codex Usage Dashboard` task. To restart the tracker after a build, run `Start-ScheduledTask -TaskName "AI Usage Tracker"`; the start script replaces whatever tracker is already holding the port.
 
 ## Test the interface without live data
 
@@ -119,7 +119,8 @@ Codex and Claude Code limits are per account, not per machine. If you work on a 
 On the server (for example `latitude7370`), with Node.js 22.5 or newer and the Codex and Claude Code CLIs signed in as the same user:
 
 ```bash
-git clone <this repo> ~/ai-usage-tracker && cd ~/ai-usage-tracker
+git clone https://github.com/Danielw412/AI-usage-tracker.git ~/projects/AI-usage-tracker
+cd ~/projects/AI-usage-tracker
 cp .env.example .env
 npm install && npm run build
 ```
@@ -132,43 +133,43 @@ DEVICE_ID=latitude7370          # any stable name; defaults to the hostname
 DEVICE_LABEL=Linux server
 SYNC_SECRET=<long random value>  # node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"
 PORT=8893
-CODEX_BIN=/home/daniel/.local/bin/codex   # absolute path; systemd has a short PATH
-# HOST=100.x.y.z                # optional: listen only on the Tailscale address
+HOST=100.x.y.z                  # the server's Tailscale IP (tailscale ip -4): only the tailnet can reach it
+CODEX_BIN=/home/<you>/.local/bin/codex   # absolute path (`which codex`)
 ```
 
-Run it as a systemd user service so it survives logouts and reboots:
+Install it as a systemd user service, so it starts at boot and survives logouts:
 
 ```bash
-mkdir -p ~/.config/systemd/user
-cp scripts/ai-usage-tracker.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now ai-usage-tracker
-loginctl enable-linger "$USER"
+bash scripts/install-linux-service.sh
 journalctl --user -u ai-usage-tracker -f
 ```
 
-The dashboard is at `http://<server>:8893`. The server scans its own sessions exactly as a standalone install does.
+The script writes `~/.config/systemd/user/ai-usage-tracker.service` for this checkout and the Node.js found on `PATH` (set `NODE_BIN` to pick another, for example `NODE_BIN=$(nvm which default)`), enables it, enables lingering, and restarts it. Rerun it after moving the checkout or changing Node versions. The unit restarts the tracker whenever it exits, so if the Tailscale address is not up yet at boot, the tracker exits, waits 10 seconds, and tries again.
 
-### 2. Set up a collector (laptop)
+The dashboard is at `http://<server>:8893`, for example `http://latitude7370.<tailnet>.ts.net:8893`. The server scans its own sessions exactly as a standalone install does.
+
+### 2. Set up a collector (Windows laptop)
 
 On the laptop, same checkout and build, then in `.env`:
 
 ```dotenv
 TRACKER_ROLE=collector
-DEVICE_ID=laptop
+DEVICE_ID=laptop                # keep the id this machine already has (see data/device.json) to keep its history labelled
 DEVICE_LABEL=Laptop
-CENTRAL_URL=http://latitude7370:8893   # the server's Tailscale name (or IP) and PORT
+CENTRAL_URL=http://latitude7370.<tailnet>.ts.net:8893   # the server's Tailscale name (or IP) and PORT
 SYNC_SECRET=<the same value as the server>
+PORT=8893
+HOST=127.0.0.1                  # the collector only needs to be reachable locally
 ```
 
-Start it the same way the tracker already runs on that machine (on Windows, `scripts\install-autostart.ps1` and the `AI Usage Tracker` scheduled task; on Linux or macOS, the systemd unit above or any process manager). The collector:
+Then run `scripts\install-autostart.ps1` once (see [Start automatically on Windows](#start-automatically-on-windows)). The `AI Usage Tracker` scheduled task starts the collector at every sign-in; Tailscale's own Windows service keeps the connection to the server up. On Linux or macOS, use `scripts/install-linux-service.sh` or any process manager instead. The collector:
 
 - watches `~/.codex/sessions`, `~/.codex/archived_sessions`, and `~/.claude/projects` and indexes a changed transcript within a couple of seconds, with the `SESSION_SCAN_MS` scan as a safety net;
 - writes every new or changed record into a local outbox **in the same SQLite transaction** that indexed it;
 - uploads the outbox in batches (500 records per request by default) a couple of seconds after activity, coalescing bursts;
 - sends a heartbeat every 90 seconds even when idle, so the server knows it is online and how far it has synchronized.
 
-Opening the collector's own port shows a message pointing to the central dashboard; `http://localhost:<PORT>/api/health` shows its sync status (queued records, last success, last error, next retry).
+Opening the collector's own port in a browser redirects to the central dashboard; `http://localhost:<PORT>/api/health` shows its sync status (queued records, last success, last error, next retry).
 
 The first time a collector reaches a server, it sends everything it has ever indexed, including history collected while it ran standalone. Uploads are idempotent, so this is safe to repeat; it happens again automatically if the server's database is ever replaced.
 
@@ -191,6 +192,24 @@ The first time a collector reaches a server, it sends everything it has ever ind
 ### Adding another collector later
 
 Repeat step 2 on the new machine with its own `DEVICE_ID` and the same `SYNC_SECRET` and `CENTRAL_URL`. Nothing changes on the server: the new device appears in the device list after its first heartbeat, its full history is uploaded, and any past windows its events fall into are recomputed automatically.
+
+### Deploying an update
+
+Push the change to GitHub, then rebuild and restart each machine. Both sides must speak the same sync protocol, so update the server and the collectors together.
+
+```bash
+# server
+cd ~/projects/AI-usage-tracker && git pull && npm install && npm run build
+systemctl --user restart ai-usage-tracker
+```
+
+```powershell
+# Windows collector
+git pull; npm install; npm run build
+Start-ScheduledTask -TaskName "AI Usage Tracker"
+```
+
+While the server restarts, collectors keep their changes queued and upload them when it is back.
 
 ### Viewing past windows
 
@@ -266,10 +285,10 @@ ai-usage-tracker/
 ├─ config/
 │  └─ pricing.json              API token prices (OpenAI and Anthropic) and model aliases
 ├─ scripts/
-│  ├─ ai-usage-tracker.service  systemd user unit for Linux (server or collector)
 │  ├─ claude-statusline-sample.mjs  Optional Claude Code status-line hook that feeds quota samples
-│  ├─ install-autostart.ps1     Windows scheduled task
-│  └─ start-ai-usage-tracker.ps1
+│  ├─ install-autostart.ps1     Windows: registers the sign-in scheduled task
+│  ├─ install-linux-service.sh  Linux: writes and enables the systemd user service
+│  └─ start-ai-usage-tracker.ps1  Windows: what the scheduled task runs
 ├─ server/
 │  ├─ codex/
 │  │  ├─ AppServerClient.ts     JSON-RPC client for codex app-server

@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import os from 'node:os';
 import type { CloudTask } from './types.js';
 
 type JsonRecord = Record<string, unknown>;
@@ -79,6 +80,9 @@ function runCodex(args: string[], timeoutMs: number): Promise<string> {
   const binary = process.env.CODEX_BIN || 'codex';
   return new Promise((resolve, reject) => {
     const child = spawn(binary, args, {
+      // `codex cloud` appends a debug log named error.log to its working
+      // directory on every call; keep it out of the checkout.
+      cwd: os.tmpdir(),
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
       shell: process.platform === 'win32'

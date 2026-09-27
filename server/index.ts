@@ -297,6 +297,14 @@ app.post('/api/refresh', async (request, response) => {
   response.json(demoMode ? demoOverview(provider.id) : provider.overview());
 });
 
+// A collector has no dashboard of its own; send browsers to the central one.
+if (isCollector && !demoMode) {
+  app.use((request, response, next) => {
+    if (request.path.startsWith('/api/') || request.method !== 'GET') return next();
+    response.redirect(302, `${config.sync.centralUrl}${request.originalUrl}`);
+  });
+}
+
 const clientDist = path.resolve(currentDir, '../dist');
 app.use(express.static(clientDist));
 app.use((request, response, next) => {
@@ -304,9 +312,17 @@ app.use((request, response, next) => {
   response.sendFile(path.join(clientDist, 'index.html'));
 });
 
-const onListening = () => {
+const where = `http://${host ?? 'localhost'}:${port}`;
+const onListening = (error?: Error) => {
+  if (error) {
+    // Express 5 hands listen errors to this callback instead of throwing. Without
+    // exiting, a tracker whose HOST address is not up yet (Tailscale still
+    // starting at boot) would keep running without serving anything, and the
+    // service manager would never restart it.
+    console.error(`AI Usage Tracker cannot listen on ${where}: ${error.message}`);
+    process.exit(1);
+  }
   const enabled = Object.values(providers).filter((provider) => provider.enabled).map((provider) => provider.label);
-  const where = `http://${host ?? 'localhost'}:${port}`;
   console.log(
     `AI Usage Tracker ${version} (${config.role}, device "${config.deviceId}"): ${where} (${enabled.join(', ') || 'no providers enabled'})`
   );
