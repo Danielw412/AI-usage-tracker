@@ -1,5 +1,5 @@
 {
-  "updatedAt": "2026-09-22",
+  "updatedAt": "2026-09-29",
   "currency": "USD",
   "models": [
     {
@@ -9,6 +9,16 @@
       "inputPerMillion": 10,
       "cachedInputPerMillion": 1,
       "outputPerMillion": 50,
+      "longContext": { "thresholdTokens": 272000, "inputMultiplier": 2, "outputMultiplier": 1.5 }
+    },
+    {
+      "id": "gpt-6.1-sol",
+      "aliases": ["gpt-6.1-sol"],
+      "provider": "openai",
+      "inputPerMillion": 2,
+      "cachedInputPerMillion": 0.1,
+      "cacheWritePerMillion": 2.5,
+      "outputPerMillion": 10,
       "longContext": { "thresholdTokens": 272000, "inputMultiplier": 2, "outputMultiplier": 1.5 }
     },
     {

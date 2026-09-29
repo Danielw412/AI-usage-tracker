@@ -85,12 +85,12 @@ function client(sources: SyncSource[], target: { url: string | null }, overrides
   });
 }
 
-function writeCodexRollout(codexHome: string, name: string, threadId: string, start: number, responses: number): string {
+function writeCodexRollout(codexHome: string, name: string, threadId: string, start: number, responses: number, model = 'gpt-5.6-sol'): string {
   const directory = path.join(codexHome, 'sessions', '2026', '09', '20');
   fs.mkdirSync(directory, { recursive: true });
   const lines: unknown[] = [
     { timestamp: iso(start), type: 'session_meta', payload: { id: threadId, cwd: '/home/daniel/project', thread_source: 'main', source: 'cli' } },
-    { timestamp: iso(start + 1), type: 'turn_context', payload: { model: 'gpt-5.6-sol', turn_id: 'turn-1' } },
+    { timestamp: iso(start + 1), type: 'turn_context', payload: { model, turn_id: 'turn-1' } },
     { timestamp: iso(start + 2), type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn-1', started_at: start + 2 } },
     {
       timestamp: iso(start + 3),
@@ -187,6 +187,67 @@ test('Codex events from a collector arrive once, with their device and log times
     assert.equal(device.deviceId, 'laptop');
     assert.equal(device.label, 'Laptop');
     assert.equal(device.status?.providers.codex?.pending, 0);
+  } finally {
+    sync.stop();
+    collector.close();
+    await central.close();
+    removeDir(root);
+  }
+});
+
+test('re-indexing unchanged GPT-6.1 Sol logs refreshes collector and server history without duplicates', async () => {
+  const root = tempDir('sync-sol-61');
+  const central = await startCentral(path.join(root, 'server'));
+  const collector = collectorStore(path.join(root, 'laptop'), 'codex');
+  const sync = client([{ provider: 'codex', store: collector, enabled: true, scannedThrough: () => baseTime(0) }], { url: central.url });
+  try {
+    const start = baseTime(1);
+    const home = path.join(root, 'codex-home');
+    const source = codexSessionSource(home);
+    const file = writeCodexRollout(home, 'rollout-sol-61.jsonl', 'thread-sol-61', start, 2, 'gpt-6.1-sol');
+    // Simulate the previous build, which saved these logs without a known price.
+    const previousSource = {
+      ...source,
+      parserVersion: '7',
+      createParser(filePath: string) {
+        const parser = source.createParser(filePath);
+        return {
+          feed: (line: string) => parser.feed(line),
+          snapshot: () => parser.snapshot(),
+          identity: () => parser.identity(),
+          async finish() {
+            const output = await parser.finish();
+            for (const part of output.parts ?? []) {
+              part.summary.estimatedApiCostUsd = null;
+              part.summary.pricingStatus = 'unknown';
+              for (const event of part.events) event.estimatedApiCostUsd = null;
+              for (const prompt of part.prompts) {
+                prompt.estimatedApiCostUsd = null;
+                prompt.pricingStatus = 'unknown';
+              }
+            }
+            return output;
+          }
+        };
+      }
+    };
+    await indexSessionFile(collector, previousSource, file);
+    assert.equal(collector.getThreadSummaries()[0].pricingStatus, 'unknown');
+    await sync.flush();
+
+    assert.equal(await indexSessionFile(collector, source, file), 'full');
+    assert.equal(await sync.flush(), true);
+    for (const target of [collector, central.stores.codex]) {
+      const [thread] = target.getThreadSummaries();
+      assert.equal(thread.pricingStatus, 'exact-model-match');
+      assert.ok(Math.abs(thread.estimatedApiCostUsd! - 0.00448) < 1e-12);
+      assert.equal(thread.prompts[0].pricingStatus, 'exact-model-match');
+      assert.ok(Math.abs(thread.prompts[0].estimatedApiCostUsd! - 0.00448) < 1e-12);
+      assert.equal(thread.totalTokens, 2_200);
+      assert.equal(target.getTokenEventsBetween(start, start + 1_000).length, 2);
+    }
+    assert.equal(await indexSessionFile(collector, source, file), 'skipped');
+    assert.equal(collector.outboxStats().pending, 0);
   } finally {
     sync.stop();
     collector.close();

@@ -253,7 +253,9 @@ interface PromptAccumulator extends PromptMetric {
 type SerializedPrompt = Omit<PromptAccumulator, 'modelTokens'> & { modelTokens: Array<[string, number]> };
 
 /** Bump when parsing changes so every rollout is indexed again. */
-export const CODEX_PARSER_VERSION = '7';
+// Re-index existing rollouts so GPT-6.1 Sol costs and prompts are refreshed,
+// including the corrected records collectors send to the central server.
+export const CODEX_PARSER_VERSION = '8';
 
 /** Everything needed to continue parsing a rollout after its last complete line. */
 interface CodexParserState {

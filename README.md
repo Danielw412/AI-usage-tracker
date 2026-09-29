@@ -441,6 +441,8 @@ The calculator separates:
 
 For supported long-context models, a request whose input exceeds the configured threshold uses the configured long-context multiplier. Prices, aliases, and historical rate changes are stored in `config/pricing.json` so they can be updated without changing the application code. Historical session costs are calculated using the rate effective when each token event was recorded. Anthropic prices come from the published Claude API pricing table; Claude 4.6 and later models have no long-context premium.
 
+GPT-6.1 Sol is priced at $2 input, $0.10 cached input, $2.50 cache writes, and $10 output per million tokens. Above 272,000 input tokens per request, these rates become $4, $0.20, $5, and $15 respectively. These are [OpenAI's standard API rates](https://developers.openai.com/api/docs/pricing). This update re-indexes existing Codex logs on startup on both collectors and the server, refreshing stored costs and syncing corrected collector records.
+
 `reasoningOutputTokens` (Codex reasoning, Claude thinking) is displayed separately when available, but is not added again to cost since it is already included in output-token accounting.
 
 ### Minutes per 1% by model

@@ -52,6 +52,32 @@ test('prices GPT-6 Sol and Luna at their launch rates', () => {
   assert.ok(cost !== null && Math.abs(cost - 16.2) < 1e-12, `cost was ${cost}`);
 });
 
+test('prices GPT-6.1 Sol independently of GPT-6 Sol, including snapshot ids', () => {
+  assertCost('gpt-6.1-sol', '2026-09-29T12:00:00Z', 1.105);
+  assertCost(' GPT-6.1-SOL ', '2026-09-29T12:00:00Z', 1.105);
+  assertCost('gpt-6.1-sol-2026-09-28', '2026-09-29T12:00:00Z', 1.105);
+  assertCost('gpt-6-sol', '2026-09-29T12:00:00Z', 1.11);
+});
+
+test('prices GPT-6.1 Sol cache writes and the long-context threshold', () => {
+  const usage: TokenUsage = {
+    inputTokens: 272_000,
+    cachedInputTokens: 100_000,
+    cacheWriteInputTokens: 20_000,
+    outputTokens: 10_000,
+    reasoningOutputTokens: 2_000,
+    totalTokens: 282_000
+  };
+  const shortCost = (152_000 * 2 + 100_000 * 0.1 + 20_000 * 2.5 + 10_000 * 10) / 1_000_000;
+  const longCost = (152_001 * 4 + 100_000 * 0.2 + 20_000 * 5 + 10_000 * 15) / 1_000_000;
+  const actualShort = estimateUsageCost('gpt-6.1-sol', usage);
+  const actualLong = estimateUsageCost('gpt-6.1-sol', {
+    ...usage, inputTokens: 272_001, totalTokens: 282_001
+  });
+  assert.ok(actualShort !== null && Math.abs(actualShort - shortCost) < 1e-12);
+  assert.ok(actualLong !== null && Math.abs(actualLong - longCost) < 1e-12);
+});
+
 test('prices Claude cache writes and reads separately from fresh input', () => {
   const usage: TokenUsage = {
     inputTokens: 11_100,
